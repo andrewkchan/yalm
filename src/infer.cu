@@ -170,33 +170,34 @@ inline float block_all_reduce_sum(float val) {
   return shared[0];
 }
 
-__device__
-inline float matmul_row(const float* row, const float* x, int dim) {
-	float sum = 0.0;
-	for (int j = 0; j < dim; j += 1) {
-		float v = row[j] * x[j];
-		sum += v;
-	}
-	return sum;
+__global__
+void matmul(const float* A, const float* x, int n, int d, float* out) {
+	// A (d,n) @ x (n,) -> out (d,)
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+	int i = blockIdx.y;
+	if (i >= d || j >= n) return;
+	atomicAdd(&out[i], A[n * i + j] * x[j]);
 }
 
-__device__
-inline float matmul_row(const half* row, const float* x, int dim) {
-	float sum = 0.0;
-	for (int j = 0; j < dim; j += 1) {
-		float v = __half2float(row[j]) * x[j];
-		sum += v;
-	}
-	return sum;
+__global__
+void matmul(const half* A, const float* x, int n, int d, float* out) {
+	// A (d,n) @ x (n,) -> out (d,)
+	int j = blockIdx.x * blockDim.x + threadIdx.x;
+	int i = blockIdx.y;
+	if (i >= d || j >= n) return;
+	atomicAdd(&out[i], __half2float(A[n * i + j]) * x[j]);
 }
 
 template <typename T>
-__global__
-void matmul(const T* A, const float* x, int n, int d, float* out) {
-	// A (d,n) @ x (n,) -> out (d,)
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= d) return;
-	out[i] = matmul_row(&A[n * i], x, n);
+inline void dispatch_matmul(const T* A, const float* x, int n, int d, float* out) {
+	int BLOCK_SIZE = 32; // arbitrary
+	dim3 blocks;
+	blocks.x = (n + BLOCK_SIZE - 1)/BLOCK_SIZE;
+	blocks.y = d;
+	dim3 tpb;
+	tpb.x = BLOCK_SIZE;
+	tpb.y = 1;
+	matmul<<<blocks, tpb>>>(A, x, n, d, out);
 }
 
 __global__
@@ -428,9 +429,9 @@ void Block::_block_cuda(
   int kv_dim = c.n_kv_heads * c.head_dim;
 
   // qkv matmuls for this position
-  matmul<<<(q_dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(wq<T>(), s.xb(), c.dim, q_dim, s.q());
-  matmul<<<(kv_dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(wk<T>(), s.xb(), c.dim, kv_dim, s.k());
-  matmul<<<(kv_dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(wv<T>(), s.xb(), c.dim, kv_dim, s.v());
+  dispatch_matmul<T>(wq<T>(), s.xb(), c.dim, q_dim, s.q());
+  dispatch_matmul<T>(wk<T>(), s.xb(), c.dim, kv_dim, s.k());
+  dispatch_matmul<T>(wv<T>(), s.xb(), c.dim, kv_dim, s.v());
   
   // some models require clipping qkv values
   clip<<<
@@ -505,7 +506,7 @@ void Block::_block_cuda(
 		);
 	}
 	// final matmul projection via wo, using `hb` as temp storage
-	matmul<<<(c.dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(wo<T>(), s.xb2(), q_dim, c.dim, s.hb());
+	dispatch_matmul<T>(wo<T>(), s.xb2(), q_dim, c.dim, s.hb());
 	
 	// attn residual back into x
 	add_residuals<<<
@@ -527,8 +528,8 @@ void Block::_block_cuda(
 	
 	// mix self.w2(F.silu(self.w1(x)) * self.w3(x))
   // Note this is a feedforward with a GLU, not a simple MLP.
-  matmul<<<(c.hidden_dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(w1<T>(), s.xb(), c.dim, c.hidden_dim, s.hb());
-  matmul<<<(c.hidden_dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(w3<T>(), s.xb(), c.dim, c.hidden_dim, s.hb2());
+  dispatch_matmul<T>(w1<T>(), s.xb(), c.dim, c.hidden_dim, s.hb());
+  dispatch_matmul<T>(w3<T>(), s.xb(), c.dim, c.hidden_dim, s.hb2());
   switch (c.act) {
 	  case ActivationType::GELU: {
 		  glu_gelu<<<
@@ -550,7 +551,7 @@ void Block::_block_cuda(
 	  }
   }
   
-  matmul<<<c.dim, warp_size>>>(w2<T>(), s.hb(), c.hidden_dim, c.dim, s.xb2());
+  dispatch_matmul<T>(w2<T>(), s.hb(), c.hidden_dim, c.dim, s.xb2());
   
 	// ffn residual back into x
 	add_residuals<<<
@@ -619,7 +620,7 @@ void matmul_cuda(float* xout, float* x, float* w, int n, int d) {
   register_cuda_host(xout, d * sizeof(float));
   x = static_cast<float*>(upload_cuda(x, n * sizeof(float)));
   w = static_cast<float*>(upload_cuda(w, n * d * sizeof(float)));
-  matmul<<<(d + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(w, x, n, d, xout);
+  dispatch_matmul<float>(w, x, n, d, xout);
   CUDA_CHECK(cudaDeviceSynchronize()); // After this, xout contains output
 	CUDA_CHECK(cudaGetLastError()); // check for kernel launch errors
   unregister_cuda_host(xout);
@@ -647,8 +648,8 @@ void ffn_cuda(
 
   // mix self.w2(F.silu(self.w1(x)) * self.w3(x))
   // Note this is a feedforward with a GLU, not a simple MLP.
-  matmul<<<(hidden_dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(w1, x, dim, hidden_dim, hb);
-  matmul<<<(hidden_dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(w3, x, dim, hidden_dim, hb2);
+  dispatch_matmul<float>(w1, x, dim, hidden_dim, hb);
+  dispatch_matmul<float>(w3, x, dim, hidden_dim, hb2);
   switch (act) {
 	  case ActivationType::GELU: {
 		  glu_gelu<<<
@@ -670,7 +671,7 @@ void ffn_cuda(
 	  }
   }
   
-  matmul<<<(dim + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(w2, hb, hidden_dim, dim, xout);
+  dispatch_matmul<float>(w2, hb, hidden_dim, dim, xout);
   CUDA_CHECK(cudaDeviceSynchronize()); // After this, xout contains output
 	CUDA_CHECK(cudaGetLastError()); // check for kernel launch errors
   unregister_cuda_host(xout);
@@ -737,13 +738,13 @@ void Model::_forward_cuda(InferenceState& s, int token, int pos, InferenceMode m
 	// classifier into logits
 	switch (c.weight_dtype) {
     case DType::F32: {
-	    matmul<<<(c.vocab_size + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(
+	    dispatch_matmul<float>(
         static_cast<float*>(wcls), s.x(), c.dim, c.vocab_size, s.logits()
       );
       break;
     }
     case DType::F16: {
-	    matmul<<<(c.vocab_size + max_threads_per_block - 1)/max_threads_per_block, max_threads_per_block>>>(
+	    dispatch_matmul<half>(
         static_cast<half*>(wcls), s.x(), c.dim, c.vocab_size, s.logits()
       );
       break;
