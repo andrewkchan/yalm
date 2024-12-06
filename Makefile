@@ -40,7 +40,7 @@ ifneq (,$(wildcard /usr/local/cuda))
   LDFLAGS+=-L/usr/local/cuda/lib64
 endif
 
-CUFLAGS+=-g -O2 -lineinfo -Ivendor
+CUFLAGS+=-O2 -lineinfo -Ivendor
 CUFLAGS+=-allow-unsupported-compiler # for recent CUDA versions
 
 ifeq ($(CUARCH),)

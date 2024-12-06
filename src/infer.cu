@@ -411,23 +411,34 @@ void att_mix(
   int warp_id = threadIdx.y;
   int t_stride = blockDim.y;
   
-  // Capacity 32 since there can be at most 32 warps in a block.
-  __shared__ float shared[32];
+  // Each lane of the warp accumulates across 2 head elements at a time.
+  // NOTE: Assumes warpSize is 32
+  __shared__ float shared0[32]; // shared0[i] == chunk[2*i]
+  __shared__ float shared1[32]; // shared1[i] == chunk[2*i+1]
   
-  for (int i = threadIdx.x; i < head_dim; i += warpSize) {
+  for (int i = 2*threadIdx.x; i < head_dim; i += 2*warpSize) {
     if (warp_id == 0) {
-      shared[threadIdx.x] = 0;
+      shared0[threadIdx.x] = 0;
+      shared1[threadIdx.x] = 0;
     }
     __syncthreads();
-    float sum = 0.0;
+    float2 sum01 = make_float2(0.0, 0.0);
     for (int t = warp_id; t < seq_len; t += t_stride) {
-      sum += __half2float(vh[kv_stride * t + i]) * atth[t];	
+      float2 v01 = __half22float2(*((half2*)&vh[kv_stride * t + i]));
+      float att_t = atth[t];
+      // Sadly CUDA does not have float2 SIMD ops
+      sum01.x += v01.x * att_t;
+      sum01.y += v01.y * att_t;
     }
-    atomicAdd(&shared[threadIdx.x], sum);
+    atomicAdd(&shared0[threadIdx.x], sum01.x);
+    atomicAdd(&shared1[threadIdx.x], sum01.y);
     __syncthreads();
     if (warp_id == 0) {
-      outh[i] = shared[threadIdx.x];
-      shared[threadIdx.x] = 0;
+      float even = shared0[threadIdx.x];
+      float odd = shared1[threadIdx.x];
+      *((float2*)&outh[i]) = make_float2(even, odd);
+      shared0[threadIdx.x] = 0;
+      shared1[threadIdx.x] = 0;
     }
   }
 }
@@ -459,10 +470,12 @@ inline void rope(
     float fcr = cosf(val);
     float fci = sinf(val);
     
-    float v0 = x[pair_idx];
-    float v1 = x[pair_idx + 1];
-    out[pair_idx] = v0 * fcr - v1 * fci;
-    out[pair_idx + 1] = v0 * fci + v1 * fcr;
+    float2 v01 = *((float2*)&x[pair_idx]);
+    float2 result = make_float2(
+      v01.x * fcr - v01.y * fci,
+      v01.x * fci + v01.y * fcr
+    );
+    *((float2*)&out[pair_idx]) = result;
   }
 }
 
@@ -477,10 +490,12 @@ inline void rope(
     float fcr = cosf(val);
     float fci = sinf(val);
     
-    float v0 = x[pair_idx];
-    float v1 = x[pair_idx + 1];
-    out[pair_idx] = __float2half(v0 * fcr - v1 * fci);
-    out[pair_idx + 1] = __float2half(v0 * fci + v1 * fcr);
+    float2 v01 = *((float2*)&x[pair_idx]);
+    half2 result = __floats2half2_rn(
+      v01.x * fcr - v01.y * fci,
+      v01.x * fci + v01.y * fcr
+    );
+    *((half2*)&out[pair_idx]) = result;
   }
 }
 
@@ -495,10 +510,12 @@ inline void rope(
     float fcr = cosf(val);
     float fci = sinf(val);
     
-    float v0 = __half2float(x[pair_idx]);
-    float v1 = __half2float(x[pair_idx + 1]);
-    out[pair_idx] = __float2half(v0 * fcr - v1 * fci);
-    out[pair_idx + 1] = __float2half(v0 * fci + v1 * fcr);
+    float2 v01 = __half22float2(*((half2*)&x[pair_idx]));
+    half2 result = __floats2half2_rn(
+      v01.x * fcr - v01.y * fci,
+      v01.x * fci + v01.y * fcr
+    );
+    *((half2*)&out[pair_idx]) = result;
   }
 }
 
