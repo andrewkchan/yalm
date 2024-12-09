@@ -4,6 +4,8 @@
 #include <cfloat>
 #include <math.h>
 
+#include "fmt/format.h"
+
 #include "immintrin.h"
 #include "f16cintrin.h"
 
@@ -30,14 +32,14 @@ static std::map<std::string, std::vector<float>> _debug_map;
 std::map<std::string, std::vector<float>>& debug_map_cpu() {
   return _debug_map;
 }
-std::vector<float> copy_debug_tensor(float* x, size_t size) {
+static std::vector<float> copy_debug_tensor(float* x, size_t size) {
   std::vector<float> out(size);
   for (size_t i = 0; i < size; i++) {
     out[i] = x[i];
   }
   return out;
 }
-void save_debug_tensor(const std::string& name, float* x, size_t size) {
+static void save_debug_tensor(const std::string& name, float* x, size_t size) {
   _debug_map[name] = copy_debug_tensor(x, size);
 }
 #endif
@@ -292,6 +294,10 @@ void Block::_block_cpu(
     attn(s.xb2(h), s.att(h), s.q(h), kh, vh, c.head_dim, c.n_kv_heads, kv_len);
   }
 
+  save_debug_tensor(
+    fmt::format("xx_layer_{:04}_att_res", _layer_i), s.xb2(), q_dim
+  );
+
   // final matmul to get output of the attention, using `hb` as temp storage
   matmul(s.hb(), s.xb2(), wo<T>(), q_dim, c.dim);
 
@@ -332,6 +338,10 @@ void Block::_block_cpu(
   for (int i = 0; i < c.dim; ++i) {
     s.x()[i] += s.xb2()[i];
   }
+
+  save_debug_tensor(
+    fmt::format("zz_layer_{:04}_out", _layer_i), s.x(), c.dim
+  );
 }
 
 void mha_cpu(
@@ -468,4 +478,8 @@ void Model::_forward_cpu(InferenceState& s, int token, int pos, InferenceMode mo
       assert(false && "unsupported weight dtype");
     }
   }
+
+  save_debug_tensor(
+    fmt::format("logits_{:04}", pos), s.logits(), c.vocab_size
+  );
 }

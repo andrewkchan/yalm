@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "fmt/format.h"
+
 #define FULL_MASK 0xffffffff
 
 #define CUDA_CHECK(x)                                                                                    \
@@ -89,12 +91,12 @@ static std::map<std::string, std::vector<float>> _debug_map;
 std::map<std::string, std::vector<float>>& debug_map_cuda() {
   return _debug_map;
 }
-std::vector<float> copy_debug_tensor(float* device, size_t numel) {
+static std::vector<float> copy_debug_tensor(float* device, size_t numel) {
   float* host = (float*)cuda_hostcopy(device, numel * sizeof(float));
   std::vector<float> fv(host, host + numel);
   return fv;
 }
-void save_debug_tensor(const std::string& name, float* x, size_t size) {
+static void save_debug_tensor(const std::string& name, float* x, size_t size) {
   _debug_map[name] = copy_debug_tensor(x, size);
 }
 #endif
@@ -844,6 +846,10 @@ void Block::_block_cuda(
     );
   }
 
+  save_debug_tensor(
+    fmt::format("xx_layer_{:04}_att_res", _layer_i), s.xb2(), q_dim
+  );
+
   // final matmul projection and residual back:
   // x <- wo(...) + x
   fused_matmul_add_residuals<<<c.dim/32, warp_size*32>>>(
@@ -884,6 +890,10 @@ void Block::_block_cuda(
   // add residual back: x <- w2(...) + x
   fused_matmul_add_residuals<<<c.dim/32, warp_size*32>>>(
     w2<T>(), s.hb(), c.hidden_dim, c.dim, s.x()
+  );
+
+  save_debug_tensor(
+    fmt::format("zz_layer_{:04}_out", _layer_i), s.x(), c.dim
   );
 }
 
@@ -1102,4 +1112,8 @@ void Model::_forward_cuda(InferenceState& s, int token, int pos, InferenceMode m
   
   CUDA_CHECK(cudaDeviceSynchronize()); // After this, s.logits contains logits of output token
   CUDA_CHECK(cudaGetLastError()); // check for kernel launch errors
+
+  save_debug_tensor(
+    fmt::format("logits_{:04}", pos), s.logits(), c.vocab_size
+  );
 }

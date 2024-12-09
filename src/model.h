@@ -6,7 +6,7 @@
 #include <vector>
 #include <map>
 
-#define DEBUG_MODEL 0
+#define DEBUG_MODEL 1
 
 constexpr int KV_SINKS = 2;
 

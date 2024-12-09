@@ -64,6 +64,8 @@ void run_completion(
   model_data.from_file(checkpoint_path);
   Model model(model_data, context);
   InferenceState state(model.config);
+  Model model_cpu(model_data, context);
+  InferenceState state_cpu(model_cpu.config);
   Sampler sampler(model.config);
   Tokenizer tokenizer(model_data);
 
@@ -83,7 +85,7 @@ void run_completion(
   // On CPU, this ensures all tensors are loaded into memory via mmap.
   // On GPU, this ensures all tensors are loaded into device memory and 
   // kernels are compiled + instantiated.
-  model.forward(state, 0, 0);
+  // model.forward(state, 0, 0);
 
   std::vector<int> encoding;
   {
@@ -111,6 +113,7 @@ void run_completion(
     InferenceMode inferMode = pos + 1 == encoding.size() ? 
       InferenceMode::OUTPUT_LOGITS : InferenceMode::HYDRATE_KV_CACHE;
     model.forward(state, token_id, pos, inferMode);
+    model_cpu.forward(state_cpu, token_id, pos, inferMode);
     read_bytes += model.config->active_bytes(pos);
   }
   uint64_t end_hydrate_ms = get_timestamp_ms();
@@ -119,13 +122,26 @@ void run_completion(
   // - Forward the model
   for (int i = 0; i < num_steps || num_steps == -1; i++) {
     int token_id = sampler.sample_argmax(state);
-    std::string token_str = tokenizer.decode_one(encoding.back(), token_id);
-    std::cout << token_str << std::flush;
+    int token_id_cpu = sampler.sample_argmax(state_cpu);
+    if (token_id != token_id_cpu || i == 55 - 1) {
+      std::cout << fmt::format("Mismatch at step {}: {} vs {}\n", i, token_id, token_id_cpu);
+      for (int shared_token : encoding) {
+        std::cout << tokenizer.decode_one(encoding.back(), shared_token) << std::flush;
+      }
+      std::cout << std::endl;
+      std::cout << "cpu: " << tokenizer.decode_one(encoding.back(), token_id_cpu) << std::endl;
+      std::cout << "cuda: " << tokenizer.decode_one(encoding.back(), token_id) << std::endl;
+      debug_tensors(*model.config);
+      exit(0);
+    }
+    // std::string token_str = tokenizer.decode_one(encoding.back(), token_id);
+    // std::cout << token_str << std::flush;
     encoding.push_back(token_id);
     if (token_id == tokenizer.eos_id || token_id == tokenizer.eot_id) {
       break;
     }
     model.forward(state, token_id, encoding.size() - 1);
+    model_cpu.forward(state_cpu, token_id, encoding.size() - 1);
     read_bytes += model.config->active_bytes(encoding.size() - 1);
   }
   std::cout << "\n" << std::endl;
