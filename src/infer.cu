@@ -423,7 +423,95 @@ void att_mix(
     }
     __syncthreads();
     float2 sum01 = make_float2(0.0, 0.0);
-    for (int t = warp_id; t < seq_len; t += t_stride) {
+    constexpr int UNROLL = 8;
+    float2  v01_0, 
+            v01_1, 
+            v01_2, 
+            v01_3,
+            v01_4,
+            v01_5,
+            v01_6,
+            v01_7;
+    float   att_0, 
+            att_1, 
+            att_2, 
+            att_3,
+            att_4,
+            att_5,
+            att_6,
+            att_7;
+    int t = warp_id;
+    for (int ctr = 0; ctr < seq_len / t_stride; t += t_stride, ctr++) {
+      int ctr_mod = ctr % UNROLL;
+      if (ctr_mod == 0) {
+        // prefetch every UNROLL iterations
+        v01_0 = __half22float2(*((half2*)&vh[kv_stride * (t + 0) + i]));
+        v01_1 = __half22float2(*((half2*)&vh[kv_stride * (t + 1) + i]));
+        v01_2 = __half22float2(*((half2*)&vh[kv_stride * (t + 2) + i]));
+        v01_3 = __half22float2(*((half2*)&vh[kv_stride * (t + 3) + i]));
+        v01_4 = __half22float2(*((half2*)&vh[kv_stride * (t + 4) + i]));
+        v01_5 = __half22float2(*((half2*)&vh[kv_stride * (t + 5) + i]));
+        v01_6 = __half22float2(*((half2*)&vh[kv_stride * (t + 6) + i]));
+        v01_7 = __half22float2(*((half2*)&vh[kv_stride * (t + 7) + i]));
+        att_0 = atth[t + 0];
+        att_1 = atth[t + 1];
+        att_2 = atth[t + 2];
+        att_3 = atth[t + 3];
+        att_4 = atth[t + 4];
+        att_5 = atth[t + 5];
+        att_6 = atth[t + 6];
+        att_7 = atth[t + 7];
+      }
+      // pull one value out of prefetch batch
+      float2 v01;
+      float att_t;
+      switch (ctr_mod) {
+        case 0: {
+          v01 = v01_0;
+          att_t = att_0;
+          break;
+        }
+        case 1: {
+          v01 = v01_1;
+          att_t = att_1;
+          break;
+        }
+        case 2: {
+          v01 = v01_2;
+          att_t = att_2;
+          break;
+        }
+        case 3: {
+          v01 = v01_3;
+          att_t = att_3;
+          break;
+        }
+        case 4: {
+          v01 = v01_4;
+          att_t = att_4;
+          break;
+        }
+        case 5: {
+          v01 = v01_5;
+          att_t = att_5;
+          break;
+        }
+        case 6: {
+          v01 = v01_6;
+          att_t = att_6;
+          break;
+        }
+        case 7: {
+          v01 = v01_7;
+          att_t = att_7;
+          break;
+        }
+      }
+      // Sadly CUDA does not have float2 SIMD ops
+      sum01.x += v01.x * att_t;
+      sum01.y += v01.y * att_t;
+    }
+    for (; t < seq_len; t += t_stride) {
       float2 v01 = __half22float2(*((half2*)&vh[kv_stride * t + i]));
       float att_t = atth[t];
       // Sadly CUDA does not have float2 SIMD ops
