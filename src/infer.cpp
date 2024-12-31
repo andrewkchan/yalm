@@ -99,6 +99,40 @@ static void matmul(float* xout, float* x, f16_t* w, int n, int d) {
 #endif
 }
 
+static void moe_gate(float* moe_weights, int* active_experts, float* x, int n_experts, int n_active_experts) {
+  // Set moe_weights[:n_active_experts] to the weights of the top K experts.
+  // Set active_experts[:n_active_experts] to the indices of the top K experts.
+
+  // get the max weight for later softmax computation
+  float max_val = -FLT_MAX;
+  for (int j = 0; j < n_experts; ++j) {
+    if (x[j] > max_val) {
+      max_val = x[j];
+    }
+  }
+  
+  // top k
+  uint64_t mask = 0;
+  float wsum = 0.0f;
+  for (int k = 0; k < n_active_experts; ++k) {
+    int best = -1;
+    for (int j = 0; j < n_experts; ++j) {
+      if ((mask & (1ull << j)) == 0 && (best == -1 || x[j] > x[best])) {
+        best = j;
+      }
+    }
+
+    active_experts[k] = best;
+    wsum += expf(x[active_experts[k]] - max_val);
+    mask |= 1ull << best;
+  }
+
+  // normalize top k weights to obtain the softmax result
+  for (int k = 0; k < n_active_experts; ++k) {
+    moe_weights[k] = expf(x[active_experts[k]] - max_val) / wsum;
+  }
+}
+
 static void rmsnorm(float* o, float* x, float* weight, int size, float eps) {
   float rms = 0.0f;
   for (int i = 0; i < size; ++i) {
@@ -311,29 +345,43 @@ void Block::_block_cpu(
     }
   }
 
-  // mix self.w2(F.silu(self.w1(x)) * self.w3(x))
-  // Note this is a feedforward with a GLU, not a simple MLP.
-  matmul(s.hb(), s.xb(), w1<T>(), c.dim, c.hidden_dim);
-  matmul(s.hb2(), s.xb(), w3<T>(), c.dim, c.hidden_dim);
-  switch (c.act) {
-    case ActivationType::GELU: {
-      for (int i = 0; i < c.hidden_dim; ++i) {
-        s.hb()[i] = gelu(s.hb()[i]) * s.hb2()[i];
-      }
-      break;
-    }
-    case ActivationType::SILU: {
-      for (int i = 0; i < c.hidden_dim; ++i) {
-        s.hb()[i] = silu(s.hb()[i]) * s.hb2()[i];
-      }
-      break;
-    }
+  if (c.n_experts > 0) {
+    matmul(s.moe_weights(), s.xb(), moegate<T>(), c.dim, c.n_experts);
+    moe_gate(s.active_experts_weights(), s.active_experts(), s.moe_weights(), c.n_experts, c.n_experts_active);
+  } else {
+    s.active_experts_weights()[0] = 1.0f;
+    s.active_experts()[0] = 0;
   }
 
-  matmul(s.xb2(), s.hb(), w2<T>(), c.hidden_dim, c.dim);
-  // residual connection back into x
-  for (int i = 0; i < c.dim; ++i) {
-    s.x()[i] += s.xb2()[i];
+  for (int k = 0; k < (c.n_experts > 0 ? c.n_experts_active : 1); ++k) {
+    int expert_index = s.active_experts()[k];
+    int expert_size = c.dim * c.hidden_dim;
+    // mix self.w2(F.silu(self.w1(x)) * self.w3(x))
+    // Note this is a feedforward with a GLU, not a simple MLP.
+    matmul(s.hb(), s.xb(), w1<T>() + expert_index * expert_size, c.dim, c.hidden_dim);
+    matmul(s.hb2(), s.xb(), w3<T>() + expert_index * expert_size, c.dim, c.hidden_dim);
+    switch (c.act) {
+      case ActivationType::GELU: {
+        for (int i = 0; i < c.hidden_dim; ++i) {
+          s.hb()[i] = gelu(s.hb()[i]) * s.hb2()[i];
+        }
+        break;
+      }
+      case ActivationType::SILU: {
+        for (int i = 0; i < c.hidden_dim; ++i) {
+          s.hb()[i] = silu(s.hb()[i]) * s.hb2()[i];
+        }
+        break;
+      }
+    }
+
+    matmul(s.xb2(), s.hb(), w2<T>() + expert_index * expert_size, c.hidden_dim, c.dim);
+    
+    float expert_weight = s.active_experts_weights()[k];
+    // residual connection back into x
+    for (int i = 0; i < c.dim; ++i) {
+      s.x()[i] += s.xb2()[i] * expert_weight;
+    }
   }
 }
 

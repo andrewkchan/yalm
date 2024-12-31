@@ -99,6 +99,10 @@ struct InferenceState {
   float* v() const { return _v; }
   float* att() const { return _att; }
   float* att(int head) const { return _att + _config->max_seq_len * head; }
+  // mixture of experts
+  float* moe_weights() const { return _moe_weights; }
+  float* active_experts_weights() const { return _active_experts_weights; }
+  int* active_experts() const { return _active_experts; }
   // LM head
   float* logits() const { return _logits; }
 
@@ -130,6 +134,10 @@ private:
   float* _k = nullptr;         // (n_kv_heads * head_dim,) - key vectors for latest timestamp
   float* _v = nullptr;         // (n_kv_heads * head_dim,) - value vectors for latest timestamp
   float* _att = nullptr;       // (n_heads, seq_len) - buffer for attention scores
+  // mixture of experts
+  float* _moe_weights = nullptr; // (n_experts,) - buffer for expert weights, decided by router
+  float* _active_experts_weights = nullptr; // (n_active_experts,) - buffer for weights of top K experts (active experts)
+  int* _active_experts = nullptr; // (n_active_experts,) - buffer for indices of top K experts (active experts)
   
   // LM head
   // NOTE: this always lives on the host (CPU), but must be registered 
@@ -150,7 +158,8 @@ struct Block {
     const Tensor* wo,
     const Tensor* w1,
     const Tensor* w2,
-    const Tensor* w3
+    const Tensor* w3,
+    const Tensor* moegate
   );
   ~Block();
 
@@ -170,6 +179,8 @@ struct Block {
   T* w2() const { return static_cast<T*>(_w2); }
   template <typename T>
   T* w3() const { return static_cast<T*>(_w3); }
+  template <typename T>
+  T* moegate() const { return static_cast<T*>(_moegate); }
   f16_t* key_cache() const { return _key_cache; }
   f16_t* value_cache() const { return _value_cache; }
 
@@ -224,6 +235,8 @@ private:
   void* _w1 = nullptr; // (n_experts?, hidden_dim, dim)
   void* _w2 = nullptr; // (n_experts?, dim, hidden_dim)
   void* _w3 = nullptr; // (n_experts?, hidden_dim, dim) - GLU weights
+  // weights for mixture of experts router if present
+  void* _moegate = nullptr; // (n_experts?, dim)
 
   // kv cache
   f16_t* _key_cache = nullptr;   // (seq_len, n_kv_heads * head_dim)

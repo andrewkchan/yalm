@@ -927,6 +927,10 @@ void Block::_block_cuda(
       break;
     }
   }
+
+  if (c.n_experts > 0) {
+    assert(false && "Mixture of experts not yet supported for CUDA");
+  }
   
   // mix self.w2(F.silu(self.w1(x)) * self.w3(x))
   // Note this is a feedforward with a GLU, not a simple MLP.
