@@ -53,6 +53,9 @@ struct Config {
   ActivationType act;       // activation function
   LayerNormType norm_type;  // norm type
   float qkv_clip;           // clip qkv values to [-clip, clip]
+  // mixture of experts
+  int n_experts;
+  int n_experts_active;
 
   // Data type of the weights according to config, used
   // to safety check tensor dtype at initialization time.

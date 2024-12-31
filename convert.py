@@ -14,7 +14,8 @@ import torch
 
 SUPPORTED_ARCHITECTURES = [
   "LlamaForCausalLM",
-  "MistralForCausalLM"
+  "MistralForCausalLM",
+  "MixtralForCausalLM"
 ]
 SUPPORTED_DTYPES = ["fp32", "fp16", "fp8"]
 
@@ -27,7 +28,7 @@ class Metadata:
     if dtype not in SUPPORTED_DTYPES:
       raise Exception(f"Data type {dtype} is not supported, must be one of {SUPPORTED_DTYPES}")
     self.dtype = dtype
-    if arch in ["MistralForCausalLM", "LlamaForCausalLM"]:
+    if arch in ["MistralForCausalLM", "LlamaForCausalLM", "MixtralForCausalLM"]:
       self.dim = config["hidden_size"]
       self.hidden_dim = config["intermediate_size"]
       self.head_dim = config.get("head_dim", config["hidden_size"] // config["num_attention_heads"])
@@ -49,12 +50,16 @@ class Metadata:
 
       assert config["hidden_act"] in ["gelu", "silu"]
       self.act_type = config["hidden_act"]
+
+      if arch in ["MixtralForCausalLM"]:
+        self.n_experts = config["num_local_experts"]
+        self.n_experts_active = config["num_experts_per_tok"]
   
   def to_dict(self):
     result = {}
     result["arch"] = self.arch
     result["dtype"] = self.dtype
-    if self.arch in ["MistralForCausalLM", "LlamaForCausalLM"]:
+    if self.arch in ["MistralForCausalLM", "LlamaForCausalLM", "MixtralForCausalLM"]:
       result["dim"] = str(self.dim)
       result["hidden_dim"] = str(self.hidden_dim)
       result["head_dim"] = str(self.head_dim)
@@ -70,6 +75,9 @@ class Metadata:
       result["norm_eps"] = str(self.norm_eps)
       result["norm_type"] = str(self.norm_type)
       result["act_type"] = str(self.act_type)
+      if self.arch in ["MixtralForCausalLM"]:
+        result["n_experts"] = str(self.n_experts)
+        result["n_experts_active"] = str(self.n_experts_active)
     return result
 
 # this is a horrible gpt-2 unicode byte encoder hack from https://github.com/openai/gpt-2/blob/master/src/encoder.py#L9
@@ -121,7 +129,6 @@ def load_weights(model_files, dtype_str, metadata, tie_word_embeddings):
   Load all weights from the model files in huggingface format into a dictionary of tensors,
   normalizing the attention weights, and casting all tensors (except for all layer norm weights,
   which are converted to float32) to the specified dtype.
-  TODO: Why do layer norm weights have to be fp32?
   """
   weights = {}
   for model_path in model_files:
@@ -178,9 +185,16 @@ def load_weights(model_files, dtype_str, metadata, tie_word_embeddings):
 
     tensors[f"model.layers.{l}.mlp.norm.weight"] = weights[f"model.layers.{l}.post_attention_layernorm.weight"].float()
 
-    tensors[f"model.layers.{l}.mlp.w1.weight"] = conv(weights[f"model.layers.{l}.mlp.gate_proj.weight"])
-    tensors[f"model.layers.{l}.mlp.w2.weight"] = conv(weights[f"model.layers.{l}.mlp.down_proj.weight"])
-    tensors[f"model.layers.{l}.mlp.w3.weight"] = conv(weights[f"model.layers.{l}.mlp.up_proj.weight"])
+    if metadata.arch in ["MixtralForCausalLM"]:
+      tensors[f"model.layers.{l}.moegate.weight"] = conv(weights[f"model.layers.{l}.block_sparse_moe.gate.weight"])
+
+      tensors[f"model.layers.{l}.mlp.w1.weight"] = torch.stack([conv(weights[f"model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight"]) for e in range(config["num_local_experts"])])
+      tensors[f"model.layers.{l}.mlp.w2.weight"] = torch.stack([conv(weights[f"model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight"]) for e in range(config["num_local_experts"])])
+      tensors[f"model.layers.{l}.mlp.w3.weight"] = torch.stack([conv(weights[f"model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight"]) for e in range(config["num_local_experts"])])
+    else:
+      tensors[f"model.layers.{l}.mlp.w1.weight"] = conv(weights[f"model.layers.{l}.mlp.gate_proj.weight"])
+      tensors[f"model.layers.{l}.mlp.w2.weight"] = conv(weights[f"model.layers.{l}.mlp.down_proj.weight"])
+      tensors[f"model.layers.{l}.mlp.w3.weight"] = conv(weights[f"model.layers.{l}.mlp.up_proj.weight"])
 
   tensors["model.norm.weight"] = weights["model.norm.weight"].float()
   if tie_word_embeddings == False:

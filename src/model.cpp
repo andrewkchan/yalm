@@ -21,6 +21,9 @@ void Config::from_yalm(YALMData& yalm, int context) {
   n_heads = std::stoi(yalm.metadata.at("n_heads").get<std::string>());
   n_kv_heads = std::stoi(yalm.metadata.at("n_kv_heads").get<std::string>());
   vocab_size = std::stoi(yalm.metadata.at("vocab_size").get<std::string>());
+  // mixture of experts
+  n_experts = std::stoi(yalm.metadata.at("n_experts").get<std::string>());
+  n_experts_active = std::stoi(yalm.metadata.at("n_experts_active").get<std::string>());
 
   // for now limit seq_len to 4096 to avoid KV cache OOM for models like Mistral since window size isn't correctly specified
   max_seq_len = std::min(std::stoi(yalm.metadata.at("max_seq_len").get<std::string>()), 4096);
