@@ -1,0 +1,77 @@
+name: Build Test (Ubuntu CUDA)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [ assigned, opened, synchronize, reopened ]
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-cuda-${{ matrix.cuda-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-20.04]
+        cuda-version: [11.8.0, 12.1.1]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Ubuntu
+        run: |
+          sudo apt-get update     
+          sudo apt-get install -y \
+            build-essential \
+            wget
+          wget -nv https://github.com/ccache/ccache/releases/download/v4.9.1/ccache-4.9.1-linux-x86_64.tar.xz
+          sudo tar xf ccache-4.9.1-linux-x86_64.tar.xz -C /usr/bin --strip-components=1 --no-same-owner ccache-4.9.1-linux-x86_64/ccache
+          rm -f ccache-*-linux-x86_64.tar.xz
+          ccache --version
+      
+      - name: Free disk space
+        if: ${{ matrix.os == 'ubuntu-20.04' }}
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/lib/php* /opt/ghc || true
+          df -h
+  
+      - name: Restore CUDA Cache
+        uses: actions/cache@v4
+        id: cuda-cache
+        with:
+          key: cuda-${{matrix.cuda-version}}-ubuntu
+          path: |
+            /usr/local/cuda*
+
+      - name: Install CUDA
+        if: ${{ steps.cuda-cache.outputs.cache-hit != 'true' }}
+        run: |
+          bash .github/workflows/cuda/${{ runner.os }}.sh ${{ matrix.os }} ${{ matrix.cuda-version }}
+
+      - name: Cache Build
+        uses: actions/cache@v4
+        id: cache-builds
+        with:
+          key: ${{ matrix.os }}-cuda-${{ matrix.cuda-version }}-ccache-${{ github.run_id }}
+          restore-keys: ${{ matrix.os }}-cuda-${{ matrix.cuda-version }}-ccache-
+          path: ${{ env.CCACHE_DIR }}
+
+      - name: Build
+        run: |
+          source .github/workflows/cuda/${{ runner.os }}-env.sh
+          make clean
+          make -j$(nproc)
+          make test
+
+      - name: Clean Compiler Cache
+        run: |
+          ccache --show-stats
+          ccache --evict-older-than 7d
+          ccache -s
