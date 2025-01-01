@@ -17,7 +17,7 @@ SUPPORTED_ARCHITECTURES = [
   "MistralForCausalLM",
   "MixtralForCausalLM"
 ]
-SUPPORTED_DTYPES = ["fp32", "fp16", "fp8"]
+SUPPORTED_DTYPES = ["fp32", "fp16", "fp8", "bf16"]
 
 class Metadata:
   def __init__(self, config, dtype):
@@ -157,7 +157,12 @@ def load_weights(model_files, dtype_str, metadata, tie_word_embeddings):
     w = torch.cat([wr, wk], dim=1)
     return torch.flatten(w, 0, 1)
 
-  dtype = {"fp32": torch.float32, "fp16": torch.float16, "fp8": torch.float8_e5m2}[dtype_str]
+  dtype = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "fp8": torch.float8_e5m2,
+    "bf16": torch.bfloat16
+  }[dtype_str]
 
   # convert weights
   progress = 0

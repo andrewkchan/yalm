@@ -62,6 +62,8 @@ void Config::from_yalm(YALMData& yalm, int context) {
     weight_dtype = DType::F32;
   } else if (dtype == "fp16") {
     weight_dtype = DType::F16;
+  } else if (dtype == "bf16") {
+    weight_dtype = DType::BF16;
   } else {
     std::cerr << "FATAL: unsupported dtype: " << dtype << std::endl;
     assert(false);
@@ -143,7 +145,8 @@ Block::Block(
   _config = config;
   switch (config->weight_dtype) {
     case DType::F32:
-    case DType::F16: {
+    case DType::F16:
+    case DType::BF16: {
       break;
     }
     default: {
@@ -271,6 +274,10 @@ void Block::block(
 #else
         assert(false && "float16 not supported on this platform");
 #endif
+        break;
+      }
+      case DType::BF16: {
+        _block_cpu<bf16_t>(s, pos, kv_sink, kv_pos, kv_len);
         break;
       }
       default: {

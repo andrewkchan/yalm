@@ -25,6 +25,49 @@ inline f16_t float_to_half(float x) {
 }
 #endif
 
+union FP32 {
+  unsigned int u;
+  float f;
+};
+
+// Un-optimized bfloat16 conversion routines.
+inline float bfloat16_to_float(bf16_t x) {
+  const uint16_t* p = reinterpret_cast<const uint16_t*>(&x);
+  uint16_t q[2];
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  q[0] = *p;
+  q[1] = 0;
+#else
+  q[0] = 0;
+  q[1] = *p;
+#endif
+  float out;
+  memcpy(&out, q, sizeof(float));
+  return out;
+}
+// Convert a float32 to bfloat16 with round-to-nearest-even rounding.
+// See:
+// https://hhhhhojeihsu.github.io/tensorflow_1.8_woboq/tensorflow_1.8_xla/tensorflow/tensorflow/core/lib/bfloat16/bfloat16.h.html
+// for a long explanation of what this is doing.
+inline bf16_t float_to_bfloat16(float v) {
+  uint32_t input;
+  FP32 f;
+  f.f = v;
+  input = f.u;
+  uint16_t output;
+  if (std::isnan(v)) {
+    output = 0x7fc0;
+  } else {
+    uint32_t lsb = (input >> 16) & 1;
+    uint32_t rounding_bias = 0x7fff + lsb;
+    input += rounding_bias;
+    output = static_cast<uint16_t>(input >> 16);
+  }
+  bf16_t result;
+  memcpy(&result, &output, sizeof(bf16_t));
+  return result;
+}
+
 #if DEBUG_MODEL
 #include "fmt/format.h"
 static std::map<std::string, DebugTensor> _debug_map;
@@ -45,6 +88,7 @@ static void save_debug_tensor(const std::string& name, T* x, size_t size) {
 }
 #endif
 
+// matmul supporting float32 weights. This is typically auto-vectorized by gcc.
 static void matmul(float* xout, float* x, float* w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   int i;
@@ -97,6 +141,21 @@ static void matmul(float* xout, float* x, f16_t* w, int n, int d) {
 #else
   assert(false && "float16 not supported on this platform");
 #endif
+}
+
+// Un-optimized matmul supporting bfloat16 weights.
+// TODO: Vectorize.
+static void matmul(float* xout, float* x, bf16_t* w, int n, int d) {
+  // W (d,n) @ x (n,) -> xout (d,)
+  int i;
+#pragma omp parallel for private(i)
+  for (i = 0; i < d; i++) {
+    float val = 0.0f;
+    for (int j = 0; j < n; j++) {
+      val += bfloat16_to_float(w[i * n + j]) * x[j];
+    }
+    xout[i] = val;
+  }
 }
 
 static void moe_gate(float* moe_weights, int* active_experts, float* x, int n_experts, int n_active_experts) {
@@ -376,7 +435,7 @@ void Block::_block_cpu(
     }
 
     matmul(s.xb2(), s.hb(), w2<T>() + expert_index * expert_size, c.hidden_dim, c.dim);
-    
+
     float expert_weight = s.active_experts_weights()[k];
     // residual connection back into x
     for (int i = 0; i < c.dim; ++i) {
@@ -450,6 +509,7 @@ void ffn_cpu(
 
 template void Block::_block_cpu<float>(InferenceState&, int, int, int, int) const;
 template void Block::_block_cpu<f16_t>(InferenceState&, int, int, int, int) const;
+template void Block::_block_cpu<bf16_t>(InferenceState&, int, int, int, int) const;
 
 void Model::_copy_embedding(InferenceState& s, int token) {
   const Config& c = *config;
@@ -465,6 +525,13 @@ void Model::_copy_embedding(InferenceState& s, int token) {
       f16_t* emb = static_cast<f16_t*>(token_embedding_table);
       for (int i = 0; i < c.dim; i+=1) {
         s.x()[i] = half_to_float(emb[token * c.dim + i]);
+      }
+      break;
+    }
+    case DType::BF16: {
+      bf16_t* emb = static_cast<bf16_t*>(token_embedding_table);
+      for (int i = 0; i < c.dim; i+=1) {
+        s.x()[i] = bfloat16_to_float(emb[token * c.dim + i]);
       }
       break;
     }
@@ -513,6 +580,10 @@ void Model::_forward_cpu(InferenceState& s, int token, int pos, InferenceMode mo
     }
     case DType::F16: {
       matmul(s.logits(), s.x(), static_cast<f16_t*>(wcls), c.dim, c.vocab_size);
+      break;
+    }
+    case DType::BF16: {
+      matmul(s.logits(), s.x(), static_cast<bf16_t*>(wcls), c.dim, c.vocab_size);
       break;
     }
     default: {
