@@ -11,6 +11,7 @@ using json = nlohmann::json;
 
 typedef uint16_t f16_t;
 typedef int16_t bf16_t;
+typedef uint8_t f8e5m2_t;
 
 // TODO: Should this be narrowed down to what we actually support for model weight representation?
 enum class DType {
