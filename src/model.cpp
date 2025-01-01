@@ -76,7 +76,12 @@ size_t Config::active_bytes(size_t pos) const {
   bytes_per_block += n_heads * head_dim * dim * weight_size; // wq
   bytes_per_block += 2 * n_kv_heads * head_dim * dim * weight_size; // wk, wv
   bytes_per_block += n_heads * head_dim * dim * weight_size; // wo
-  bytes_per_block += 3 * dim * hidden_dim * weight_size; // w1, w2, w3
+  if (n_experts > 0) {
+    bytes_per_block += n_experts * dim * weight_size; // moegate
+    bytes_per_block += n_experts_active * 3 * dim * hidden_dim * weight_size; // w1, w2, w3
+  } else {
+    bytes_per_block += 3 * dim * hidden_dim * weight_size; // w1, w2, w3
+  }
   size_t kv_len = std::min(static_cast<size_t>(max_seq_len), pos + 1);
   size_t kv_entry_size = sizeof(f16_t);
   bytes_per_block += 2 * kv_len * n_kv_heads * head_dim * kv_entry_size; // key_cache, value_cache
@@ -86,7 +91,6 @@ size_t Config::active_bytes(size_t pos) const {
   bytes += n_layers * bytes_per_block; // blocks
   bytes += dim * sizeof(float); // rms_final_weight
   bytes += vocab_size * dim * sizeof(float); // wcls
-  // TODO account for MOE
 
   return bytes;
 }
