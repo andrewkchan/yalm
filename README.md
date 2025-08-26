@@ -29,7 +29,7 @@ git clone git@github.com:andrewkchan/yalm.git
 cd yalm
 pip install -r requirements.txt
 python convert.py --dtype fp16 mistral-7b-instruct-fp16.yalm ../Mistral-7B-Instruct-v0.2/
-./build/main mistral-7b-instruct-fp16.yalm -i "What is a large language model?" -m c
+make && ./build/main mistral-7b-instruct-fp16.yalm -i "What is a large language model?" -m c
 ```
 
 # Usage
