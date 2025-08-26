@@ -449,7 +449,7 @@ void att_mix(
     half2 v01_14; float att_14;
     half2 v01_15; float att_15;
     int t = warp_id;
-    for (int ctr = 0; ctr < seq_len / t_stride; t += t_stride, ctr++) {
+    for (int ctr = 0; ctr < seq_len / t_stride - UNROLL + 1; t += t_stride, ctr++) {
       int ctr_mod = ctr % UNROLL;
       if (ctr_mod == 0) {
         // prefetch every UNROLL iterations
@@ -713,6 +713,7 @@ void rotate_sink_tokens(
   float theta, 				// RoPE theta parameter
   int rotary_dim			// how many dimensions to rotate
 ) {
+  if (kv_sink == 0) return;
   // Each thread handles two consecutive elements (for RoPE complex rotation)
   // across all attention sinks
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -806,10 +807,10 @@ void Block::_block_cuda(
     params.extra = nullptr;
     s.graph().add_or_update_kernel_node(fmt::format("{}:fused_rope_and_cache_update", _layer_i), params, s.stream());
   }
-  if (kv_sink > 0) {
+  {
     // Sink tokens remain untouched while the rest of the KV cache is incrementally 
     // replaced in ring order, but sink i must always be positioned (max_seq_len - i)
-    // away from current timestep. Hence, each forward pass, rotate sink tokens 
+    // away from current timestep. Hence, each forward pass, rotate any sink tokens 
     // forward by 1. See https://arxiv.org/abs/2309.17453 for more.
     int threads_needed = (kv_dim + 1) / 2;  // Each thread handles 2 elements
     int num_blocks = (threads_needed + max_threads_per_block - 1) / max_threads_per_block;
@@ -1237,6 +1238,11 @@ void CudaGraph::add_or_update_kernel_node(std::string key, cudaKernelNodeParams 
     // Update the stream dependency
     CUDA_CHECK(cudaStreamUpdateCaptureDependencies(stream, &new_node, 1, 1));
   } else {
-    CUDA_CHECK(cudaGraphExecKernelNodeSetParams(instance, nodes[key], &params));
+    auto it = nodes.find(key);
+    if (it != nodes.end()) {
+      CUDA_CHECK(cudaGraphExecKernelNodeSetParams(instance, it->second, &params));
+    } else {
+      assert(false && "adding new graph nodes after capture currently not supported");
+    }
   }
 }
