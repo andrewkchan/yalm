@@ -137,9 +137,22 @@ __device__
 inline float warp_all_reduce_max(float val) {
   // Max reduction across a warp.
   // All threads will contain the max of all threads in the warp.
-  for (int mask = warpSize/2; mask > 0; mask /= 2) {
-    val = max(val, __shfl_xor_sync(FULL_MASK, val, mask));
+  for (int offset = warpSize/2; offset > 0; offset /= 2) {
+    val = max(val, __shfl_xor_sync(FULL_MASK, val, offset));
   }
+  return val;
+}
+
+__device__ 
+inline float warp_all_reduce_max_mask(float val, unsigned mask) {
+  // Max reduction across a warp.
+  // All threads will contain the max of all threads in the warp.
+  // Unlike `warp_all_reduce_max`, this function can be used when
+  // not all threads in the warp are active (lane 0 must still be active).
+  for (int offset = warpSize/2; offset > 0; offset /= 2) {
+    val = max(val, __shfl_down_sync(mask, val, offset));
+  }
+  val = __shfl_sync(mask, val, 0); // Broadcast from lane 0
   return val;
 }
 
@@ -176,9 +189,22 @@ __device__
 inline float warp_all_reduce_sum(float val) {
   // Sum reduction across a warp.
   // All threads will contain the sum of all threads in the warp.
-  for (int mask = warpSize/2; mask > 0; mask /= 2) {
-    val += __shfl_xor_sync(FULL_MASK, val, mask);
+  for (int offset = warpSize/2; offset > 0; offset /= 2) {
+    val += __shfl_xor_sync(FULL_MASK, val, offset);
   }
+  return val;
+}
+
+__device__ 
+inline float warp_all_reduce_sum_mask(float val, unsigned mask) {
+  // Sum reduction across a warp.
+  // All threads will contain the max of all threads in the warp.
+  // Unlike `warp_all_reduce_sum`, this function can be used when
+  // not all threads in the warp are active (lane 0 must still be active).
+  for (int offset = warpSize/2; offset > 0; offset /= 2) {
+    val += __shfl_down_sync(mask, val, offset);
+  }
+  val = __shfl_sync(mask, val, 0); // Broadcast from lane 0
   return val;
 }
 
@@ -520,6 +546,132 @@ void att_mix(
       shared1[threadIdx.x] = 0;
     }
   }
+}
+
+__global__
+void fused_attn(
+  const half* kb,  // (max_seq_len, n_kv_heads, head_dim) 
+  const half* vb, // (max_seq_len, n_kv_heads, head_dim) 
+  const float* q,   // (n_heads, head_dim)
+  int head_dim, 
+  int kv_len, 
+  int max_seq_len, 
+  int n_heads, 
+  int n_kv_heads,
+  int kv_len_per_tile,
+  float* out         // (n_heads, head_dim)
+) {
+	// PRECOND: 
+	// * blockDim.x == WARP_SIZE 
+	// * blockDim.y == q_heads_per_tile
+	// * q_heads_per_tile % group_size == 0 or group_size % q_heads_per_tile == 0
+	
+	int q_heads_per_tile = blockDim.y;
+	int group_size = n_heads / n_kv_heads;
+	int kv_heads_per_tile = (q_heads_per_tile + group_size - 1) / group_size;
+	
+	// See https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/
+	// for why these are allocated this way
+	extern __shared__ float dynamic_pool[];
+	
+	float* kqt = dynamic_pool; // (kv_len_per_tile, q_heads_per_tile)
+	float* m = &kqt[kv_len_per_tile*q_heads_per_tile]; // softmax maxval (q_heads_per_tile,)
+	float* l = &m[q_heads_per_tile]; // denominator (q_heads_per_tile,)
+	float* acc = &l[q_heads_per_tile]; // accumulator (q_heads_per_tile, head_dim)
+	
+	float* q_tile = &acc[q_heads_per_tile*head_dim]; // (q_heads_per_tile, head_dim)
+	float* k_tile = &q_tile[q_heads_per_tile*head_dim]; // (kv_len_per_tile, kv_heads_per_tile, head_dim)
+	float* v_tile = &k_tile[kv_len_per_tile * kv_heads_per_tile * head_dim]; // (kv_len_per_tile, kv_heads_per_tile, head_dim)
+	
+	int t_start = threadIdx.x; // 0..31
+	int h = blockIdx.y * blockDim.y + threadIdx.y;
+	int h_tile = threadIdx.y;
+  unsigned mask = __ballot_sync(FULL_MASK, t_start < kv_len && h < n_heads);
+	if (t_start >= kv_len || h >= n_heads) return;
+	
+	// Load q tile and reset shared state
+	if (threadIdx.x == 0) {
+		m[h_tile] = -INFINITY;
+		l[h_tile] = 0.0f;
+		for (int i = 0; i < head_dim; i++) {
+			q_tile[h_tile * head_dim + i] = q[h * head_dim + i];
+			acc[h_tile * head_dim + i] = 0.0f;
+		}
+	}
+	
+	for (int t = t_start; t < kv_len; t += kv_len_per_tile) {
+		// Load next kv tiles
+		int kvh = h / group_size;
+		int t_tile = t % kv_len_per_tile;
+		int kvh_tile = kvh % kv_heads_per_tile;
+		if (h % kv_heads_per_tile == 0) {
+      // TODO: Improve load packing - issuing redundant loads per tile sometimes
+			for (int i = 0; i < head_dim; i++) {
+				k_tile[t_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim + i] = 
+          __half2float(kb[t * n_kv_heads * head_dim + kvh * head_dim + i]);
+				v_tile[t_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim + i] =
+          __half2float(vb[t * n_kv_heads * head_dim + kvh * head_dim + i]);
+			}
+		}
+		__syncthreads();
+		
+		// Compute KQ^T dot products
+		float* query = q_tile + h_tile * head_dim;
+		float local_max = m[h_tile];
+		for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += blockDim.x) {
+			int s_tile = s % kv_len_per_tile;
+			float* key = k_tile + s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim;
+			float score = 0.0f;
+			for (int i = 0; i < head_dim; i++) {
+        score += query[i] * key[i];
+			}
+      score /= sqrtf(head_dim);
+      kqt[s_tile * q_heads_per_tile + h_tile] = score;
+			local_max = std::fmax(local_max, score);
+		}
+		
+		// Compute tile max, update online softmax state
+		float head_max = warp_all_reduce_max_mask(local_max, mask);
+		float delta = 0.0f; // local to tid 0
+		if (threadIdx.x == 0) {
+			delta = head_max - m[h_tile];
+			m[h_tile] = head_max;
+			l[h_tile] *= expf(-delta);
+		}
+		float local_sum = 0.0f;
+		for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += blockDim.x) {
+      int s_tile = s % kv_len_per_tile;
+			local_sum += expf(kqt[s_tile * q_heads_per_tile + h_tile] - head_max);
+		}
+		float head_sum = warp_all_reduce_sum_mask(local_sum, mask);
+		if (threadIdx.x == 0) {
+			l[h_tile] += head_sum;
+			for (int i = 0; i < head_dim; i++) {
+				acc[h_tile * head_dim + i] *= expf(-delta);
+			}
+		}
+		__syncwarp();
+		// Accumulate
+		for (int i = 0; i < head_dim; i++) {
+			float sum = 0.0f;
+			for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += blockDim.x) {
+        int s_tile = s % kv_len_per_tile;
+        float logit = expf(kqt[s_tile * q_heads_per_tile + h_tile] - head_max);
+				float* value = v_tile + s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim;
+				sum += logit * value[i];
+			}
+			sum = warp_all_reduce_sum_mask(sum, mask);
+			if (threadIdx.x == 0) {
+        acc[h_tile * head_dim + i] += sum;
+      }
+		}
+	}
+	// Normalize and write back accumulated values
+	if (threadIdx.x == 0) {
+		for (int i = 0; i < head_dim; i++) {
+			out[h * head_dim + i] = acc[h_tile * head_dim + i] / l[h_tile];
+		}
+	}
 }
 
 __global__
@@ -967,7 +1119,8 @@ void mha_cuda(
   f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
   f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
   float* q,     // (n_heads, head_dim)
-  int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
+  int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads,
+  bool use_flash_attention
 ) {
   int warp_size = 32;
   int max_threads_per_block = 1024;
@@ -977,33 +1130,61 @@ void mha_cuda(
   kb = static_cast<f16_t*>(upload_cuda(kb, max_seq_len * n_kv_heads * head_dim * sizeof(f16_t)));
   vb = static_cast<f16_t*>(upload_cuda(vb, max_seq_len * n_kv_heads * head_dim * sizeof(f16_t)));
   q = static_cast<float*>(upload_cuda(q, n_heads * head_dim * sizeof(float)));
-  // multihead attention: dot products and softmax
-  {
+  if (use_flash_attention) {
+    int group_size = n_heads / n_kv_heads;
+    int q_heads_per_tile = 1; // set to group size or 1 (redundant GQA)
+    int kv_heads_per_tile = (q_heads_per_tile + group_size - 1) / group_size;
+    int kv_len_per_tile = warp_size;
     dim3 tpb;
     tpb.x = warp_size;
-    tpb.y = n_heads / n_kv_heads;
+    tpb.y = q_heads_per_tile;
     dim3 blocks;
-    blocks.x = (kv_len + tpb.x - 1) / tpb.x;
+    blocks.x = 1;
     blocks.y = (n_heads + tpb.y - 1) / tpb.y;
-    attn_dot<<<blocks, tpb, 0, cudaStreamLegacy>>>(
-      (half*)kb, q, head_dim, kv_len, max_seq_len, n_heads, n_kv_heads, att
+    size_t shared_memory_size = sizeof(float) * (
+      kv_len_per_tile*q_heads_per_tile +
+      q_heads_per_tile +
+      q_heads_per_tile +
+      q_heads_per_tile*head_dim +
+      q_heads_per_tile*head_dim +
+      kv_len_per_tile*kv_heads_per_tile*head_dim +
+      kv_len_per_tile*kv_heads_per_tile*head_dim
     );
-    attn_softmax<<<n_heads, warp_size, 0, cudaStreamLegacy>>>(
-      att, kv_len, max_seq_len, n_heads, att
+    fused_attn<<<blocks, tpb, shared_memory_size>>>(
+      (half*) kb, (half*) vb, q, 
+      head_dim, kv_len, max_seq_len, 
+      n_heads, n_kv_heads, kv_len_per_tile, 
+      xout
     );
-  }
-  // multihead attention: mix values with attention scores
-  {
-    dim3 tpb;
-    tpb.x = warp_size;
-    tpb.y = min(kv_len, max_threads_per_block / warp_size);
-    dim3 blocks;
-    blocks.x = n_heads;
-    att_mix<<<blocks, tpb, 0, cudaStreamLegacy>>>(
-      (half*)vb, att,
-      head_dim, n_heads, n_kv_heads, 
-      kv_len, max_seq_len, xout
-    );
+  } else {
+    // multihead attention: dot products and softmax
+    {
+      dim3 tpb;
+      tpb.x = warp_size;
+      tpb.y = n_heads / n_kv_heads;
+      dim3 blocks;
+      blocks.x = (kv_len + tpb.x - 1) / tpb.x;
+      blocks.y = (n_heads + tpb.y - 1) / tpb.y;
+      attn_dot<<<blocks, tpb, 0, cudaStreamLegacy>>>(
+        (half*)kb, q, head_dim, kv_len, max_seq_len, n_heads, n_kv_heads, att
+      );
+      attn_softmax<<<n_heads, warp_size, 0, cudaStreamLegacy>>>(
+        att, kv_len, max_seq_len, n_heads, att
+      );
+    }
+    // multihead attention: mix values with attention scores
+    {
+      dim3 tpb;
+      tpb.x = warp_size;
+      tpb.y = min(kv_len, max_threads_per_block / warp_size);
+      dim3 blocks;
+      blocks.x = n_heads;
+      att_mix<<<blocks, tpb, 0, cudaStreamLegacy>>>(
+        (half*)vb, att,
+        head_dim, n_heads, n_kv_heads, 
+        kv_len, max_seq_len, xout
+      );
+    }
   }
   CUDA_CHECK(cudaDeviceSynchronize()); // After this, xout contains output
   CUDA_CHECK(cudaGetLastError()); // check for kernel launch errors

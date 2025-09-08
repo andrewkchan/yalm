@@ -151,8 +151,8 @@ void test_cuda_kernels() {
   int dim = head_dim * n_heads;
   int hidden_dim = dim;
   int n_kv_heads = 8;
-  int max_seq_len = 4;
-  int kv_len = 4;
+  int max_seq_len = 256;
+  int kv_len = 200;
 
   // matmul
   {
@@ -168,7 +168,7 @@ void test_cuda_kernels() {
   }
 
   // mha
-  {
+  for (bool use_flash_attention : {true, false}) {
     std::vector<f16_t> kb(max_seq_len * n_kv_heads * head_dim);
     fill_random(kb.data(), kb.size(), 0);
     std::vector<f16_t> vb(max_seq_len * n_kv_heads * head_dim);
@@ -193,10 +193,13 @@ void test_cuda_kernels() {
       kb.data(), 
       vb.data(), 
       q.data(), 
-      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
+      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads,
+      use_flash_attention
     );
-    assertArrayEquals(att_cuda, att_cpu, "mha att");
-    assertArrayEquals(xout_cuda, xout_cpu, "mha xout");
+    if (!use_flash_attention) {
+      assertArrayEquals(att_cuda, att_cpu, "mha att");
+    }
+    assertArrayEquals(xout_cuda, xout_cpu, fmt::format("mha xout (use_flash_attention={})", use_flash_attention));
   }
 
   // ffn
@@ -362,7 +365,7 @@ void kernel_bench(const std::string& kernel_name) {
     fill_random(x.data(), x.size(), 1);
     std::vector<float> xout_cuda(hidden_dim);
     matmul_cuda<f16_t>(xout_cuda.data(), x.data(), w.data(), dim, hidden_dim);
-  } else if (kernel_name == "mha") {
+  } else if (kernel_name == "mha" || kernel_name == "mha_flash_attn") {
     std::vector<f16_t> kb(max_seq_len * n_kv_heads * head_dim);
     fill_random(kb.data(), kb.size(), 0);
     std::vector<f16_t> vb(max_seq_len * n_kv_heads * head_dim);
@@ -371,13 +374,15 @@ void kernel_bench(const std::string& kernel_name) {
     fill_random(q.data(), q.size(), 2);
     std::vector<float> att_cuda(n_heads * max_seq_len);
     std::vector<float> xout_cuda(n_heads * head_dim);
+    bool use_flash_attention = kernel_name == "mha_flash_attn";
     mha_cuda(
       xout_cuda.data(), 
       att_cuda.data(),
       kb.data(), 
       vb.data(), 
       q.data(), 
-      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
+      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads,
+      use_flash_attention
     );
   } else if (kernel_name == "ffn") {
     std::vector<float> x(dim);

@@ -318,7 +318,8 @@ void mha_cuda(
   f16_t* kb,    // (max_seq_len, n_kv_heads, head_dim)
   f16_t* vb,    // (max_seq_len, n_kv_heads, head_dim)
   float* q,     // (n_heads, head_dim)
-  int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads
+  int head_dim, int kv_len, int max_seq_len, int n_heads, int n_kv_heads,
+  bool use_flash_attention
 );
 
 void matmul_cpu(float* xout, float* x, float* w, int n, int d);
