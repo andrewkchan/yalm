@@ -565,6 +565,7 @@ void fused_attn(
 	// * blockDim.x == WARP_SIZE 
 	// * blockDim.y == q_heads_per_tile
 	// * q_heads_per_tile % group_size == 0 or group_size % q_heads_per_tile == 0
+  // * head_dim >= WARP_SIZE && head_dim % WARP_SIZE == 0
 	
 	int q_heads_per_tile = blockDim.y;
 	int group_size = n_heads / n_kv_heads;
@@ -572,18 +573,19 @@ void fused_attn(
 	
 	// See https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/
 	// for why these are allocated this way
-	extern __shared__ float dynamic_pool[];
+	extern __shared__ uint8_t dynamic_pool[];
 	
-	float* kqt = dynamic_pool; // (kv_len_per_tile, q_heads_per_tile)
+	float* kqt = (float*)dynamic_pool; // (kv_len_per_tile, q_heads_per_tile)
 	float* m = &kqt[kv_len_per_tile*q_heads_per_tile]; // softmax maxval (q_heads_per_tile,)
 	float* l = &m[q_heads_per_tile]; // denominator (q_heads_per_tile,)
 	float* acc = &l[q_heads_per_tile]; // accumulator (q_heads_per_tile, head_dim)
 	
 	float* q_tile = &acc[q_heads_per_tile*head_dim]; // (q_heads_per_tile, head_dim)
-	float* k_tile = &q_tile[q_heads_per_tile*head_dim]; // (kv_len_per_tile, kv_heads_per_tile, head_dim)
-	float* v_tile = &k_tile[kv_len_per_tile * kv_heads_per_tile * head_dim]; // (kv_len_per_tile, kv_heads_per_tile, head_dim)
+	half* k_tile = (half*)&q_tile[q_heads_per_tile*head_dim]; // (kv_len_per_tile, kv_heads_per_tile, head_dim)
+	half* v_tile = (half*)&k_tile[kv_len_per_tile * kv_heads_per_tile * head_dim]; // (kv_len_per_tile, kv_heads_per_tile, head_dim)
 	
-	int t_start = threadIdx.x; // 0..31
+	int t_start = 0;
+  int i_start = threadIdx.x; // 0..31
 	int h = blockIdx.y * blockDim.y + threadIdx.y;
 	int h_tile = threadIdx.y;
   unsigned mask = __ballot_sync(FULL_MASK, t_start < kv_len && h < n_heads);
@@ -602,36 +604,101 @@ void fused_attn(
 	for (int t = t_start; t < kv_len; t += kv_len_per_tile) {
 		// Load next kv tiles
 		int kvh = h / group_size;
-		int t_tile = t % kv_len_per_tile;
-		int kvh_tile = kvh % kv_heads_per_tile;
-		if (h % kv_heads_per_tile == 0) {
-      // TODO: Improve load packing - issuing redundant loads per tile sometimes
-			for (int i = 0; i < head_dim; i++) {
-				k_tile[t_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim + i] = 
-          __half2float(kb[t * n_kv_heads * head_dim + kvh * head_dim + i]);
-				v_tile[t_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim + i] =
-          __half2float(vb[t * n_kv_heads * head_dim + kvh * head_dim + i]);
-			}
-		}
+    int kvh_tile = kvh % kv_heads_per_tile;
+    for (int s = t+threadIdx.x; s < min(t+threadIdx.x+kv_len_per_tile, kv_len); s += blockDim.x) {
+			int s_tile = s % kv_len_per_tile;
+      if (h % kv_heads_per_tile == 0) {
+        // TODO: Improve load packing - issuing redundant loads per tile sometimes
+        constexpr int UNROLL = 16;
+        half v_0; half k_0; 
+        half v_1; half k_1; 
+        half v_2; half k_2; 
+        half v_3; half k_3;
+        half v_4; half k_4; 
+        half v_5; half k_5; 
+        half v_6; half k_6; 
+        half v_7; half k_7;
+        half v_8; half k_8; 
+        half v_9; half k_9; 
+        half v_10; half k_10; 
+        half v_11; half k_11;
+        half v_12; half k_12; 
+        half v_13; half k_13; 
+        half v_14; half k_14; 
+        half v_15; half k_15;
+        for (int i = 0; i < head_dim; i++) {
+          int ctr_mod = i % UNROLL;
+          if (ctr_mod == 0) {
+            // Prefetch every UNROLL iters
+            #define PREFETCH(j) \
+              v_##j = vb[s * n_kv_heads * head_dim + kvh * head_dim + i + j]; \
+              k_##j = kb[s * n_kv_heads * head_dim + kvh * head_dim + i + j];
+            PREFETCH(0)
+            PREFETCH(1)
+            PREFETCH(2)
+            PREFETCH(3)
+            PREFETCH(4)
+            PREFETCH(5)
+            PREFETCH(6)
+            PREFETCH(7)
+            PREFETCH(8)
+            PREFETCH(9)
+            PREFETCH(10)
+            PREFETCH(11)
+            PREFETCH(12)
+            PREFETCH(13)
+            PREFETCH(14)
+            PREFETCH(15)
+            #undef PREFETCH
+          }
+          // pull one value out of prefetch batch
+          switch (ctr_mod) {
+            #define CASE(j) \
+              case j: { \
+                k_tile[s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim + i] = k_##j; \
+                v_tile[s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim + i] = v_##j; \
+                break; \
+              }
+            CASE(0)
+            CASE(1)
+            CASE(2)
+            CASE(3)
+            CASE(4)
+            CASE(5)
+            CASE(6)
+            CASE(7)
+            CASE(8)
+            CASE(9)
+            CASE(10)
+            CASE(11)
+            CASE(12)
+            CASE(13)
+            CASE(14)
+            CASE(15)
+            #undef CASE
+          }
+        }
+      }
+    }
 		__syncthreads();
 		
 		// Compute KQ^T dot products
 		float* query = q_tile + h_tile * head_dim;
 		float local_max = m[h_tile];
-		for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += blockDim.x) {
+		for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += 1) {
 			int s_tile = s % kv_len_per_tile;
-			float* key = k_tile + s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim;
-			float score = 0.0f;
-			for (int i = 0; i < head_dim; i++) {
-        score += query[i] * key[i];
-			}
-      score /= sqrtf(head_dim);
-      kqt[s_tile * q_heads_per_tile + h_tile] = score;
-			local_max = std::fmax(local_max, score);
+			half* key = k_tile + s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim;
+      int offset = threadIdx.x % warpSize;
+			float score = matmul_row(key, query, offset, head_dim);
+      if (offset == 0) {
+        score /= sqrtf(head_dim);
+        kqt[s_tile * q_heads_per_tile + h_tile] = score;
+        local_max = std::fmax(local_max, score);
+      }
 		}
 		
 		// Compute tile max, update online softmax state
-		float head_max = warp_all_reduce_max_mask(local_max, mask);
+		float head_max = __shfl_sync(mask, local_max, 0);
 		float delta = 0.0f; // local to tid 0
 		if (threadIdx.x == 0) {
 			delta = head_max - m[h_tile];
@@ -639,7 +706,7 @@ void fused_attn(
 			l[h_tile] *= expf(-delta);
 		}
 		float local_sum = 0.0f;
-		for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += blockDim.x) {
+		for (int s = t+threadIdx.x; s < min(t+threadIdx.x+kv_len_per_tile, kv_len); s += blockDim.x) {
       int s_tile = s % kv_len_per_tile;
 			local_sum += expf(kqt[s_tile * q_heads_per_tile + h_tile] - head_max);
 		}
@@ -652,18 +719,15 @@ void fused_attn(
 		}
 		__syncwarp();
 		// Accumulate
-		for (int i = 0; i < head_dim; i++) {
+		for (int i = i_start; i < head_dim; i+=blockDim.x) {
 			float sum = 0.0f;
-			for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += blockDim.x) {
+			for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += 1) {
         int s_tile = s % kv_len_per_tile;
         float logit = expf(kqt[s_tile * q_heads_per_tile + h_tile] - head_max);
-				float* value = v_tile + s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim;
-				sum += logit * value[i];
+				half* value = v_tile + s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim;
+				sum += logit * __half2float(value[i]);
 			}
-			sum = warp_all_reduce_sum_mask(sum, mask);
-			if (threadIdx.x == 0) {
-        acc[h_tile * head_dim + i] += sum;
-      }
+      acc[h_tile * head_dim + i] += sum;
 		}
 	}
 	// Normalize and write back accumulated values
@@ -983,86 +1047,132 @@ void Block::_block_cuda(
     params.extra = nullptr;
     s.graph().add_or_update_kernel_node(fmt::format("{}:rotate_sink_tokens", _layer_i), params, s.stream());
   }
-  
-  // multihead attention: dot products and softmax
-  {
+
+  constexpr bool USE_FLASH_ATTENTION = true;
+  if (USE_FLASH_ATTENTION) {
+    int group_size = c.n_heads / c.n_kv_heads;
+    int q_heads_per_tile = 2; // set to group size or 1 (redundant GQA)
+    int kv_heads_per_tile = (q_heads_per_tile + group_size - 1) / group_size;
+    int kv_len_per_tile = 128;
     dim3 tpb;
     tpb.x = warp_size;
-    tpb.y = c.n_heads / c.n_kv_heads;
+    tpb.y = q_heads_per_tile;
     dim3 blocks;
-    blocks.x = (kv_len + tpb.x - 1) / tpb.x;
+    blocks.x = 1;
     blocks.y = (c.n_heads + tpb.y - 1) / tpb.y;
-
-    {
-      cudaKernelNodeParams params;
-      params.blockDim = tpb;
-      params.gridDim = blocks;
-      params.sharedMemBytes = 0;
-      params.func = reinterpret_cast<void*>(attn_dot);
-      float* q = s.q();
-      float* att = s.att();
-      void* kernelParams[] = {
-        &kb,
-        &q,
-        (void*)&c.head_dim,
-        &kv_len,
-        (void*)&c.max_seq_len,
-        (void*)&c.n_heads,
-        (void*)&c.n_kv_heads,
-        &att
-      };
-      params.kernelParams = kernelParams;
-      params.extra = nullptr;
-      s.graph().add_or_update_kernel_node(fmt::format("{}:attn_dot", _layer_i), params, s.stream());
-    }
-
-    {
-      cudaKernelNodeParams params;
-      params.blockDim = {static_cast<unsigned int>(warp_size), 1, 1};
-      params.gridDim = {static_cast<unsigned int>(c.n_heads), 1, 1};
-      params.sharedMemBytes = 0;
-      params.func = reinterpret_cast<void*>(attn_softmax);
-      float* att = s.att();
-      void* kernelParams[] = {
-        &att,
-        &kv_len,
-        (void*)&c.max_seq_len,
-        (void*)&c.n_heads,
-        &att
-      };
-      params.kernelParams = kernelParams;
-      params.extra = nullptr;
-      s.graph().add_or_update_kernel_node(fmt::format("{}:attn_softmax", _layer_i), params, s.stream());
-    }
-  }
-  // multihead attention: mix values with attention scores
-  {
-    dim3 tpb;
-    tpb.x = warp_size;
-    tpb.y = min(kv_len, max_threads_per_block / warp_size);
-    dim3 blocks;
-    blocks.x = c.n_heads;
 
     cudaKernelNodeParams params;
     params.blockDim = tpb;
     params.gridDim = blocks;
-    params.sharedMemBytes = 0;
-    params.func = reinterpret_cast<void*>(att_mix);
-    float* att = s.att();
+    params.sharedMemBytes = (
+      sizeof(float)*kv_len_per_tile*q_heads_per_tile +
+      sizeof(float)*q_heads_per_tile +
+      sizeof(float)*q_heads_per_tile +
+      sizeof(float)*q_heads_per_tile*c.head_dim +
+      sizeof(float)*q_heads_per_tile*c.head_dim +
+      sizeof(half)*kv_len_per_tile*kv_heads_per_tile*c.head_dim +
+      sizeof(half)*kv_len_per_tile*kv_heads_per_tile*c.head_dim
+    );
+    params.func = reinterpret_cast<void*>(fused_attn);
+    float* q = s.q();
     float* xb2 = s.xb2();
     void* kernelParams[] = {
-      &vb,
-      &att,
-      (void*)&c.head_dim,
-      (void*)&c.n_heads,
-      (void*)&c.n_kv_heads,
-      &kv_len,
-      (void*)&c.max_seq_len,
+      &kb, 
+      &vb, 
+      &q, 
+      (void*)&c.head_dim, 
+      &kv_len, 
+      (void*)&c.max_seq_len, 
+      (void*)&c.n_heads, 
+      (void*)&c.n_kv_heads, 
+      &kv_len_per_tile, 
       &xb2
     };
     params.kernelParams = kernelParams;
     params.extra = nullptr;
-    s.graph().add_or_update_kernel_node(fmt::format("{}:att_mix", _layer_i), params, s.stream());
+    CUDA_CHECK(cudaFuncSetAttribute(fused_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, params.sharedMemBytes));
+    s.graph().add_or_update_kernel_node(fmt::format("{}:fused_attn", _layer_i), params, s.stream());
+  } else {
+    // multihead attention: dot products and softmax
+    {
+      dim3 tpb;
+      tpb.x = warp_size;
+      tpb.y = c.n_heads / c.n_kv_heads;
+      dim3 blocks;
+      blocks.x = (kv_len + tpb.x - 1) / tpb.x;
+      blocks.y = (c.n_heads + tpb.y - 1) / tpb.y;
+  
+      {
+        cudaKernelNodeParams params;
+        params.blockDim = tpb;
+        params.gridDim = blocks;
+        params.sharedMemBytes = 0;
+        params.func = reinterpret_cast<void*>(attn_dot);
+        float* q = s.q();
+        float* att = s.att();
+        void* kernelParams[] = {
+          &kb,
+          &q,
+          (void*)&c.head_dim,
+          &kv_len,
+          (void*)&c.max_seq_len,
+          (void*)&c.n_heads,
+          (void*)&c.n_kv_heads,
+          &att
+        };
+        params.kernelParams = kernelParams;
+        params.extra = nullptr;
+        s.graph().add_or_update_kernel_node(fmt::format("{}:attn_dot", _layer_i), params, s.stream());
+      }
+  
+      {
+        cudaKernelNodeParams params;
+        params.blockDim = {static_cast<unsigned int>(warp_size), 1, 1};
+        params.gridDim = {static_cast<unsigned int>(c.n_heads), 1, 1};
+        params.sharedMemBytes = 0;
+        params.func = reinterpret_cast<void*>(attn_softmax);
+        float* att = s.att();
+        void* kernelParams[] = {
+          &att,
+          &kv_len,
+          (void*)&c.max_seq_len,
+          (void*)&c.n_heads,
+          &att
+        };
+        params.kernelParams = kernelParams;
+        params.extra = nullptr;
+        s.graph().add_or_update_kernel_node(fmt::format("{}:attn_softmax", _layer_i), params, s.stream());
+      }
+    }
+    // multihead attention: mix values with attention scores
+    {
+      dim3 tpb;
+      tpb.x = warp_size;
+      tpb.y = min(kv_len, max_threads_per_block / warp_size);
+      dim3 blocks;
+      blocks.x = c.n_heads;
+  
+      cudaKernelNodeParams params;
+      params.blockDim = tpb;
+      params.gridDim = blocks;
+      params.sharedMemBytes = 0;
+      params.func = reinterpret_cast<void*>(att_mix);
+      float* att = s.att();
+      float* xb2 = s.xb2();
+      void* kernelParams[] = {
+        &vb,
+        &att,
+        (void*)&c.head_dim,
+        (void*)&c.n_heads,
+        (void*)&c.n_kv_heads,
+        &kv_len,
+        (void*)&c.max_seq_len,
+        &xb2
+      };
+      params.kernelParams = kernelParams;
+      params.extra = nullptr;
+      s.graph().add_or_update_kernel_node(fmt::format("{}:att_mix", _layer_i), params, s.stream());
+    }
   }
 
   // final matmul projection and residual back:
@@ -1132,24 +1242,25 @@ void mha_cuda(
   q = static_cast<float*>(upload_cuda(q, n_heads * head_dim * sizeof(float)));
   if (use_flash_attention) {
     int group_size = n_heads / n_kv_heads;
-    int q_heads_per_tile = 1; // set to group size or 1 (redundant GQA)
+    int q_heads_per_tile = 2; // set to group size or 1 (redundant GQA)
     int kv_heads_per_tile = (q_heads_per_tile + group_size - 1) / group_size;
-    int kv_len_per_tile = warp_size;
+    int kv_len_per_tile = 128;
     dim3 tpb;
     tpb.x = warp_size;
     tpb.y = q_heads_per_tile;
     dim3 blocks;
     blocks.x = 1;
     blocks.y = (n_heads + tpb.y - 1) / tpb.y;
-    size_t shared_memory_size = sizeof(float) * (
-      kv_len_per_tile*q_heads_per_tile +
-      q_heads_per_tile +
-      q_heads_per_tile +
-      q_heads_per_tile*head_dim +
-      q_heads_per_tile*head_dim +
-      kv_len_per_tile*kv_heads_per_tile*head_dim +
-      kv_len_per_tile*kv_heads_per_tile*head_dim
+    size_t shared_memory_size = (
+      sizeof(float)*kv_len_per_tile*q_heads_per_tile +
+      sizeof(float)*q_heads_per_tile +
+      sizeof(float)*q_heads_per_tile +
+      sizeof(float)*q_heads_per_tile*head_dim +
+      sizeof(float)*q_heads_per_tile*head_dim +
+      sizeof(half)*kv_len_per_tile*kv_heads_per_tile*head_dim +
+      sizeof(half)*kv_len_per_tile*kv_heads_per_tile*head_dim
     );
+    CUDA_CHECK(cudaFuncSetAttribute(fused_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory_size));
     fused_attn<<<blocks, tpb, shared_memory_size>>>(
       (half*) kb, (half*) vb, q, 
       head_dim, kv_len, max_seq_len, 
