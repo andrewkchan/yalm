@@ -612,7 +612,7 @@ void fused_attn(
 		// Load next kv tiles
 		int kvh = h / group_size;
     int kvh_tile = kvh % kv_heads_per_tile;
-    for (int s = t+threadIdx.x; s < min(t+threadIdx.x+kv_len_per_tile, kv_len); s += blockDim.x) {
+    for (int s = t+threadIdx.x; s < min(t+threadIdx.x+kv_len_per_tile, t_end); s += blockDim.x) {
 			int s_tile = s % kv_len_per_tile;
       if (h % kv_heads_per_tile == 0) {
         // TODO: Improve load packing - issuing redundant loads per tile sometimes
@@ -692,7 +692,7 @@ void fused_attn(
 		// Compute KQ^T dot products
 		float* query = q_tile + h_tile * head_dim;
 		float local_max = m[h_tile];
-		for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += 1) {
+		for (int s = t; s < min(t+kv_len_per_tile, t_end); s += 1) {
 			int s_tile = s % kv_len_per_tile;
 			half* key = k_tile + s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim;
       int offset = threadIdx.x % warpSize;
@@ -713,7 +713,7 @@ void fused_attn(
 			l[h_tile] *= expf(-delta);
 		}
 		float local_sum = 0.0f;
-		for (int s = t+threadIdx.x; s < min(t+threadIdx.x+kv_len_per_tile, kv_len); s += blockDim.x) {
+		for (int s = t+threadIdx.x; s < min(t+threadIdx.x+kv_len_per_tile, t_end); s += blockDim.x) {
       int s_tile = s % kv_len_per_tile;
 			local_sum += expf(kqt[s_tile * q_heads_per_tile + h_tile] - head_max);
 		}
@@ -728,7 +728,7 @@ void fused_attn(
 		// Accumulate
 		for (int i = i_start; i < head_dim; i+=blockDim.x) {
 			float sum = 0.0f;
-			for (int s = t; s < min(t+kv_len_per_tile, kv_len); s += 1) {
+			for (int s = t; s < min(t+kv_len_per_tile, t_end); s += 1) {
         int s_tile = s % kv_len_per_tile;
         float logit = expf(kqt[s_tile * q_heads_per_tile + h_tile] - head_max);
 				half* value = v_tile + s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim;
