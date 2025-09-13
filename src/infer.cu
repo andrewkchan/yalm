@@ -554,19 +554,25 @@ void fused_attn(
   const half* vb, // (max_seq_len, n_kv_heads, head_dim) 
   const float* q,   // (n_heads, head_dim)
   int head_dim, 
+  int max_kv_len_per_split,
   int kv_len, 
   int max_seq_len, 
   int n_heads, 
   int n_kv_heads,
   int kv_len_per_tile,
-  float* out         // (n_heads, head_dim)
+  float* out,         // (n_splits, n_heads, head_dim)
+  float* out_l,       // (n_splits, n_heads,)
+  float* out_m        // (n_splits, n_heads,)
 ) {
 	// PRECOND: 
 	// * blockDim.x == WARP_SIZE 
 	// * blockDim.y == q_heads_per_tile
+  // * gridDim.x == n_splits == cdiv(kv_len, max_kv_len_per_split)
+  // * gridDim.y == n_heads / q_heads_per_tile
 	// * q_heads_per_tile % group_size == 0 or group_size % q_heads_per_tile == 0
   // * head_dim >= WARP_SIZE && head_dim % WARP_SIZE == 0
 	
+  int split = blockIdx.x;
 	int q_heads_per_tile = blockDim.y;
 	int group_size = n_heads / n_kv_heads;
 	int kv_heads_per_tile = (q_heads_per_tile + group_size - 1) / group_size;
@@ -584,7 +590,8 @@ void fused_attn(
 	half* k_tile = (half*)&q_tile[q_heads_per_tile*head_dim]; // (kv_len_per_tile, kv_heads_per_tile, head_dim)
 	half* v_tile = (half*)&k_tile[kv_len_per_tile * kv_heads_per_tile * head_dim]; // (kv_len_per_tile, kv_heads_per_tile, head_dim)
 	
-	int t_start = 0;
+	int t_start = max_kv_len_per_split * split;
+  int t_end = min(kv_len, max_kv_len_per_split * (split + 1));
   int i_start = threadIdx.x; // 0..31
 	int h = blockIdx.y * blockDim.y + threadIdx.y;
 	int h_tile = threadIdx.y;
@@ -601,7 +608,7 @@ void fused_attn(
 		}
 	}
 	
-	for (int t = t_start; t < kv_len; t += kv_len_per_tile) {
+	for (int t = t_start; t < t_end; t += kv_len_per_tile) {
 		// Load next kv tiles
 		int kvh = h / group_size;
     int kvh_tile = kvh % kv_heads_per_tile;
@@ -733,9 +740,50 @@ void fused_attn(
 	// Normalize and write back accumulated values
 	if (threadIdx.x == 0) {
 		for (int i = 0; i < head_dim; i++) {
-			out[h * head_dim + i] = acc[h_tile * head_dim + i] / l[h_tile];
+			out[split * n_heads * head_dim + h * head_dim + i] = acc[h_tile * head_dim + i]; 
 		}
+    out_l[split * n_heads + h] = l[h_tile];
+    out_m[split * n_heads + h] = m[h_tile];
 	}
+}
+
+__global__
+void fused_attn_mix(
+  float* acc,   // (n_splits, n_heads, head_dim)
+  float* l,     // (n_splits, n_heads)
+  float* m,     // (n_splits, n_heads)
+  int n_splits,
+  int n_heads,
+  int head_dim,
+  float* out    // (n_heads, head_dim)
+) {
+  // PRECOND: 
+	// * blockDim.x == head_dim
+  // * head_dim % WARP_SIZE == 0
+  // * blocks-per-grid is 1D
+  // * threads-per-block is 1D
+
+  int h = blockIdx.x;
+  int i = threadIdx.x;
+
+  if (h >= n_heads || i >= head_dim) return;
+
+  float max_m = -INFINITY;
+  float acc_item = 0.0f;
+  float l_item = 0.0f;
+  for (int split = 0; split < n_splits; split++) {
+    float* acc_head = acc + split*n_heads*head_dim + h*head_dim;
+    float delta = m[h] - max_m;
+    if (delta > 0.0) {
+      acc_item = acc_item*expf(-delta) + acc_head[i];
+      l_item = l_item*expf(-delta) + l[split*n_heads + h];
+      max_m += delta;
+    } else {
+      acc_item = acc_item + acc_head[i]*expf(delta);
+      l_item = l_item + l[split*n_heads + h]*expf(delta);
+    }
+  }
+  out[h*head_dim + i] = acc_item / l_item;
 }
 
 __global__
@@ -1050,48 +1098,87 @@ void Block::_block_cuda(
 
   constexpr bool USE_FLASH_ATTENTION = true;
   if (USE_FLASH_ATTENTION) {
-    int group_size = c.n_heads / c.n_kv_heads;
-    int q_heads_per_tile = 2; // set to group size or 1 (redundant GQA)
-    int kv_heads_per_tile = (q_heads_per_tile + group_size - 1) / group_size;
-    int kv_len_per_tile = 128;
-    dim3 tpb;
-    tpb.x = warp_size;
-    tpb.y = q_heads_per_tile;
-    dim3 blocks;
-    blocks.x = 1;
-    blocks.y = (c.n_heads + tpb.y - 1) / tpb.y;
-
-    cudaKernelNodeParams params;
-    params.blockDim = tpb;
-    params.gridDim = blocks;
-    params.sharedMemBytes = (
-      sizeof(float)*kv_len_per_tile*q_heads_per_tile +
-      sizeof(float)*q_heads_per_tile +
-      sizeof(float)*q_heads_per_tile +
-      sizeof(float)*q_heads_per_tile*c.head_dim +
-      sizeof(float)*q_heads_per_tile*c.head_dim +
-      sizeof(half)*kv_len_per_tile*kv_heads_per_tile*c.head_dim +
-      sizeof(half)*kv_len_per_tile*kv_heads_per_tile*c.head_dim
-    );
-    params.func = reinterpret_cast<void*>(fused_attn);
-    float* q = s.q();
-    float* xb2 = s.xb2();
-    void* kernelParams[] = {
-      &kb, 
-      &vb, 
-      &q, 
-      (void*)&c.head_dim, 
-      &kv_len, 
-      (void*)&c.max_seq_len, 
-      (void*)&c.n_heads, 
-      (void*)&c.n_kv_heads, 
-      &kv_len_per_tile, 
-      &xb2
-    };
-    params.kernelParams = kernelParams;
-    params.extra = nullptr;
-    CUDA_CHECK(cudaFuncSetAttribute(fused_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, params.sharedMemBytes));
-    s.graph().add_or_update_kernel_node(fmt::format("{}:fused_attn", _layer_i), params, s.stream());
+    // min kv_len_per_tile, else whatever kv_len_per_split would be taken by max_splits number of splits
+    int max_kv_len_per_split = std::max(c.kv_len_per_tile, (kv_len + c.max_splits - 1) / c.max_splits);
+    // if max_kv_len_per_split == kv_len_per_tile, then it's possible n_splits != max_splits
+    int n_splits = (kv_len + max_kv_len_per_split - 1) / max_kv_len_per_split;
+    // first fused attn kernel - sdpa over split-kvlen
+    {
+      dim3 tpb;
+      tpb.x = warp_size;
+      tpb.y = c.q_heads_per_tile;
+      dim3 blocks;
+      blocks.x = n_splits;
+      blocks.y = (c.n_heads + tpb.y - 1) / tpb.y;
+  
+      cudaKernelNodeParams params;
+      params.blockDim = tpb;
+      params.gridDim = blocks;
+      params.sharedMemBytes = (
+        sizeof(float)*c.kv_len_per_tile*c.q_heads_per_tile +
+        sizeof(float)*c.q_heads_per_tile +
+        sizeof(float)*c.q_heads_per_tile +
+        sizeof(float)*c.q_heads_per_tile*c.head_dim +
+        sizeof(float)*c.q_heads_per_tile*c.head_dim +
+        sizeof(half)*c.kv_len_per_tile*c.kv_heads_per_tile*c.head_dim +
+        sizeof(half)*c.kv_len_per_tile*c.kv_heads_per_tile*c.head_dim
+      );
+      params.func = reinterpret_cast<void*>(fused_attn);
+      float* q = s.q();
+      float* out = s.fused_attn_acc();
+      float* out_l = s.fused_attn_l();
+      float* out_m = s.fused_attn_m();
+      void* kernelParams[] = {
+        &kb, 
+        &vb, 
+        &q, 
+        (void*)&c.head_dim, 
+        &max_kv_len_per_split,
+        &kv_len, 
+        (void*)&c.max_seq_len, 
+        (void*)&c.n_heads, 
+        (void*)&c.n_kv_heads, 
+        (void*)&c.kv_len_per_tile, 
+        &out,
+        &out_l,
+        &out_m
+      };
+      params.kernelParams = kernelParams;
+      params.extra = nullptr;
+      CUDA_CHECK(cudaFuncSetAttribute(fused_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, params.sharedMemBytes));
+      s.graph().add_or_update_kernel_node(fmt::format("{}:fused_attn", _layer_i), params, s.stream());
+    }
+    
+    // second kernel - mix splits
+    {
+      assert(c.head_dim % warp_size == 0);
+      dim3 tpb;
+      tpb.x = c.head_dim;
+      dim3 blocks;
+      blocks.x = c.n_heads;
+  
+      cudaKernelNodeParams params;
+      params.blockDim = tpb;
+      params.gridDim = blocks;
+      params.sharedMemBytes = 0;
+      params.func = reinterpret_cast<void*>(fused_attn_mix);
+      float* xb2 = s.xb2();
+      float* acc = s.fused_attn_acc();
+      float* l = s.fused_attn_l();
+      float* m = s.fused_attn_m();
+      void* kernelParams[] = {
+        &acc,
+        &l,
+        &m,
+        &n_splits, 
+        (void*)&c.n_heads, 
+        (void*)&c.head_dim, 
+        &xb2
+      };
+      params.kernelParams = kernelParams;
+      params.extra = nullptr;
+      s.graph().add_or_update_kernel_node(fmt::format("{}:fused_attn_mix", _layer_i), params, s.stream());
+    }
   } else {
     // multihead attention: dot products and softmax
     {
@@ -1242,31 +1329,65 @@ void mha_cuda(
   q = static_cast<float*>(upload_cuda(q, n_heads * head_dim * sizeof(float)));
   if (use_flash_attention) {
     int group_size = n_heads / n_kv_heads;
+    constexpr int L40S_NUM_SMS = 142;
+    // fused attn hparams
     int q_heads_per_tile = 2; // set to group size or 1 (redundant GQA)
     int kv_heads_per_tile = (q_heads_per_tile + group_size - 1) / group_size;
-    int kv_len_per_tile = 128;
-    dim3 tpb;
-    tpb.x = warp_size;
-    tpb.y = q_heads_per_tile;
-    dim3 blocks;
-    blocks.x = 1;
-    blocks.y = (n_heads + tpb.y - 1) / tpb.y;
-    size_t shared_memory_size = (
-      sizeof(float)*kv_len_per_tile*q_heads_per_tile +
-      sizeof(float)*q_heads_per_tile +
-      sizeof(float)*q_heads_per_tile +
-      sizeof(float)*q_heads_per_tile*head_dim +
-      sizeof(float)*q_heads_per_tile*head_dim +
-      sizeof(half)*kv_len_per_tile*kv_heads_per_tile*head_dim +
-      sizeof(half)*kv_len_per_tile*kv_heads_per_tile*head_dim
-    );
-    CUDA_CHECK(cudaFuncSetAttribute(fused_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory_size));
-    fused_attn<<<blocks, tpb, shared_memory_size>>>(
-      (half*) kb, (half*) vb, q, 
-      head_dim, kv_len, max_seq_len, 
-      n_heads, n_kv_heads, kv_len_per_tile, 
-      xout
-    );
+    int kv_len_per_tile = 64;
+    // try to fully utilize GPU
+    int max_splits = L40S_NUM_SMS;
+    
+    // min kv_len_per_tile, else whatever kv_len_per_split would be taken by max_splits number of splits
+    int max_kv_len_per_split = std::max(kv_len_per_tile, (kv_len + max_splits - 1) / max_splits);
+    // if max_kv_len_per_split == kv_len_per_tile, then it's possible n_splits != max_splits
+    int n_splits = (kv_len + max_kv_len_per_split - 1) / max_kv_len_per_split;
+
+    float* fused_attn_out_acc = new float[n_splits * n_heads * head_dim]();
+    fused_attn_out_acc = static_cast<float*>(upload_cuda(fused_attn_out_acc, sizeof(float) * (n_splits * n_heads * head_dim)));
+    float* fused_attn_out_l = new float[n_splits * n_heads]();
+    fused_attn_out_l = static_cast<float*>(upload_cuda(fused_attn_out_l, sizeof(float) * (n_splits * n_heads)));
+    float* fused_attn_out_m = new float[n_splits * n_heads]();
+    fused_attn_out_m = static_cast<float*>(upload_cuda(fused_attn_out_m, sizeof(float) * (n_splits * n_heads)));
+    // fused attn kernel 1 - sdpa over split-kv_len
+    {
+      dim3 tpb;
+      tpb.x = warp_size;
+      tpb.y = q_heads_per_tile;
+      dim3 blocks;
+      blocks.x = n_splits;
+      blocks.y = (n_heads + tpb.y - 1) / tpb.y;
+      size_t shared_memory_size = (
+        sizeof(float)*kv_len_per_tile*q_heads_per_tile +
+        sizeof(float)*q_heads_per_tile +
+        sizeof(float)*q_heads_per_tile +
+        sizeof(float)*q_heads_per_tile*head_dim +
+        sizeof(float)*q_heads_per_tile*head_dim +
+        sizeof(half)*kv_len_per_tile*kv_heads_per_tile*head_dim +
+        sizeof(half)*kv_len_per_tile*kv_heads_per_tile*head_dim
+      );
+      CUDA_CHECK(cudaFuncSetAttribute(fused_attn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory_size));
+      fused_attn<<<blocks, tpb, shared_memory_size>>>(
+        (half*) kb, (half*) vb, q, 
+        head_dim, max_kv_len_per_split, kv_len, max_seq_len, 
+        n_heads, n_kv_heads, kv_len_per_tile, 
+        fused_attn_out_acc, fused_attn_out_l, fused_attn_out_m
+      );
+      CUDA_CHECK(cudaGetLastError());
+    }
+
+    // fused attn kernel 2 - mix splits
+    {
+      assert(head_dim % warp_size == 0);
+      dim3 tpb;
+      tpb.x = head_dim;
+      dim3 blocks;
+      blocks.x = n_heads;
+      fused_attn_mix<<<blocks, tpb, 0>>>(
+        fused_attn_out_acc, fused_attn_out_l, fused_attn_out_m,
+        n_splits, n_heads, head_dim, xout
+      );
+      CUDA_CHECK(cudaGetLastError());
+    }
   } else {
     // multihead attention: dot products and softmax
     {

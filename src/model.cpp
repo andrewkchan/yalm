@@ -13,6 +13,7 @@
 
 using json = nlohmann::json;
 
+constexpr int L40S_NUM_SMS = 142;
 void Config::from_yalm(YALMData& yalm, int context) {
   dim = std::stoi(yalm.metadata.at("dim").get<std::string>());
   hidden_dim = std::stoi(yalm.metadata.at("hidden_dim").get<std::string>());
@@ -24,6 +25,14 @@ void Config::from_yalm(YALMData& yalm, int context) {
   // mixture of experts
   n_experts = yalm.metadata.contains("n_experts") ? std::stoi(yalm.metadata.at("n_experts").get<std::string>()) : 0;
   n_experts_active = yalm.metadata.contains("n_experts_active") ? std::stoi(yalm.metadata.at("n_experts_active").get<std::string>()) : 0;
+
+  // fused attn hparams
+  int group_size = n_heads / n_kv_heads;
+  q_heads_per_tile = 2; // set to group size or 1 (redundant GQA)
+  kv_heads_per_tile = (q_heads_per_tile + group_size - 1) / group_size;
+  kv_len_per_tile = 64;
+  // try to fully utilize GPU
+  max_splits = L40S_NUM_SMS;
 
   // for now limit seq_len to 4096 to avoid KV cache OOM for models like Mistral since window size isn't correctly specified
   max_seq_len = std::min(std::stoi(yalm.metadata.at("max_seq_len").get<std::string>()), 4096);
@@ -293,6 +302,11 @@ InferenceState::InferenceState(const std::shared_ptr<Config> config):
   _k = new float[config->n_kv_heads * config->head_dim]();
   _v = new float[config->n_kv_heads * config->head_dim]();
   _att = new float[config->n_heads * config->max_seq_len]();
+  
+  _fused_attn_acc = new float[config->max_splits * config->n_heads * config->head_dim]();
+  _fused_attn_l = new float[config->max_splits * config->n_heads];
+  _fused_attn_m = new float[config->max_splits * config->n_heads];
+  
   _logits = new float[config->vocab_size]();
   _moe_weights = new float[config->n_experts]();
   _active_experts = new int[config->n_experts_active]();
@@ -310,6 +324,9 @@ InferenceState::~InferenceState() {
     delete[] _k;
     delete[] _v;
     delete[] _att;
+    delete[] _fused_attn_acc;
+    delete[] _fused_attn_l;
+    delete[] _fused_attn_m;
     delete[] _logits;
     delete[] _moe_weights;
     delete[] _active_experts;
@@ -324,6 +341,9 @@ InferenceState::~InferenceState() {
     free_cuda(_k);
     free_cuda(_v);
     free_cuda(_att);
+    free_cuda(_fused_attn_acc);
+    free_cuda(_fused_attn_l);
+    free_cuda(_fused_attn_m);
     unregister_cuda_host(_logits);
     delete[] _logits;
     free_cuda(_moe_weights);
@@ -347,6 +367,11 @@ void InferenceState::cuda() {
   _k = static_cast<float*>(upload_cuda(_k, _config->n_kv_heads * _config->head_dim * sizeof(float)));
   _v = static_cast<float*>(upload_cuda(_v, _config->n_kv_heads * _config->head_dim * sizeof(float)));
   _att = static_cast<float*>(upload_cuda(_att, _config->n_heads * _config->max_seq_len * sizeof(float)));
+  
+  _fused_attn_acc = static_cast<float*>(upload_cuda(_fused_attn_acc, _config->max_splits * _config->n_heads * _config->head_dim * sizeof(float)));
+  _fused_attn_l = static_cast<float*>(upload_cuda(_fused_attn_l, _config->max_splits * _config->n_heads * sizeof(float)));
+  _fused_attn_m = static_cast<float*>(upload_cuda(_fused_attn_m, _config->max_splits * _config->n_heads * sizeof(float)));
+  
   register_cuda_host(_logits, _config->vocab_size * sizeof(float));
   _moe_weights = static_cast<float*>(upload_cuda(_moe_weights, _config->n_experts * sizeof(float)));
   _active_experts = static_cast<int*>(upload_cuda(_active_experts, _config->n_experts_active * sizeof(int)));

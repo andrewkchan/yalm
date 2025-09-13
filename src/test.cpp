@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "immintrin.h"
+#include "fmt/format.h"
 
 #include "model.h"
 #include "time.h"
@@ -146,13 +147,12 @@ void fill_random(f16_t* data, size_t N, unsigned long seed, float scale_factor =
 }
 
 void test_cuda_kernels() {
-  int head_dim = 16;
-  int n_heads = 16;
+  int head_dim = 128;
+  int n_heads = 32;
   int dim = head_dim * n_heads;
   int hidden_dim = dim;
   int n_kv_heads = 8;
-  int max_seq_len = 256;
-  int kv_len = 200;
+  int max_seq_len = 4096;
 
   // matmul
   {
@@ -168,38 +168,40 @@ void test_cuda_kernels() {
   }
 
   // mha
-  for (bool use_flash_attention : {true, false}) {
-    std::vector<f16_t> kb(max_seq_len * n_kv_heads * head_dim);
-    fill_random(kb.data(), kb.size(), 0);
-    std::vector<f16_t> vb(max_seq_len * n_kv_heads * head_dim);
-    fill_random(vb.data(), vb.size(), 1);
-    std::vector<float> q(n_heads * head_dim);
-    fill_random(q.data(), q.size(), 2);
-    std::vector<float> att_cpu(n_heads * max_seq_len);
-    std::vector<float> att_cuda(n_heads * max_seq_len);
-    std::vector<float> xout_cpu(n_heads * head_dim);
-    std::vector<float> xout_cuda(n_heads * head_dim);
-    mha_cpu(
-      xout_cpu.data(),
-      att_cpu.data(),
-      kb.data(), 
-      vb.data(), 
-      q.data(), 
-      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
-    );
-    mha_cuda(
-      xout_cuda.data(), 
-      att_cuda.data(),
-      kb.data(), 
-      vb.data(), 
-      q.data(), 
-      head_dim, kv_len, max_seq_len, n_heads, n_kv_heads,
-      use_flash_attention
-    );
-    if (!use_flash_attention) {
-      assertArrayEquals(att_cuda, att_cpu, "mha att");
+  for (int kv_len : {100, 400, 800, 2000, 4096}) {
+    for (bool use_flash_attention : {true, false}) {
+      std::vector<f16_t> kb(max_seq_len * n_kv_heads * head_dim);
+      fill_random(kb.data(), kb.size(), 0);
+      std::vector<f16_t> vb(max_seq_len * n_kv_heads * head_dim);
+      fill_random(vb.data(), vb.size(), 1);
+      std::vector<float> q(n_heads * head_dim);
+      fill_random(q.data(), q.size(), 2);
+      std::vector<float> att_cpu(n_heads * max_seq_len);
+      std::vector<float> att_cuda(n_heads * max_seq_len);
+      std::vector<float> xout_cpu(n_heads * head_dim);
+      std::vector<float> xout_cuda(n_heads * head_dim);
+      mha_cpu(
+        xout_cpu.data(),
+        att_cpu.data(),
+        kb.data(), 
+        vb.data(), 
+        q.data(), 
+        head_dim, kv_len, max_seq_len, n_heads, n_kv_heads
+      );
+      mha_cuda(
+        xout_cuda.data(), 
+        att_cuda.data(),
+        kb.data(), 
+        vb.data(), 
+        q.data(), 
+        head_dim, kv_len, max_seq_len, n_heads, n_kv_heads,
+        use_flash_attention
+      );
+      if (!use_flash_attention) {
+        assertArrayEquals(att_cuda, att_cpu, "mha att");
+      }
+      assertArrayEquals(xout_cuda, xout_cpu, fmt::format("mha xout (use_flash_attention={})", use_flash_attention));
     }
-    assertArrayEquals(xout_cuda, xout_cpu, fmt::format("mha xout (use_flash_attention={})", use_flash_attention));
   }
 
   // ffn

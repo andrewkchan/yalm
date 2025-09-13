@@ -57,6 +57,12 @@ struct Config {
   int n_experts;
   int n_experts_active;
 
+  // fused attn hparams
+  int q_heads_per_tile;
+  int kv_heads_per_tile;
+  int kv_len_per_tile;
+  int max_splits;
+
   // Data type of the weights according to config, used
   // to safety check tensor dtype at initialization time.
   DType weight_dtype;
@@ -99,6 +105,9 @@ struct InferenceState {
   float* v() const { return _v; }
   float* att() const { return _att; }
   float* att(int head) const { return _att + _config->max_seq_len * head; }
+  float* fused_attn_acc() const { return _fused_attn_acc; }
+  float* fused_attn_l() const { return _fused_attn_l; }
+  float* fused_attn_m() const { return _fused_attn_m; }
   // mixture of experts
   float* moe_weights() const { return _moe_weights; }
   float* active_experts_weights() const { return _active_experts_weights; }
@@ -126,7 +135,6 @@ private:
   // current activations
   float* _x = nullptr;         // (dim,) - latest activation
   float* _xb = nullptr;        // (dim,) - activation inside a residual branch
-  // TODO: do we need xb2?
   float* _xb2 = nullptr;       // (dim,) - activation inside a residual branch (second slot)
   float* _hb = nullptr;        // (hidden_dim,) - buffer for hidden dimension in feedforward network
   float* _hb2 = nullptr;       // (hidden_dim,) - buffer for hidden dimension in feedforward network (second slot)
@@ -134,6 +142,9 @@ private:
   float* _k = nullptr;         // (n_kv_heads * head_dim,) - key vectors for latest timestamp
   float* _v = nullptr;         // (n_kv_heads * head_dim,) - value vectors for latest timestamp
   float* _att = nullptr;       // (n_heads, seq_len) - buffer for attention scores
+  float* _fused_attn_acc = nullptr; // (max_splits, n_heads, head_dim) 
+  float* _fused_attn_l = nullptr; // (max_splits, n_heads) 
+  float* _fused_attn_m = nullptr; // (max_splits, n_heads)
   // mixture of experts
   float* _moe_weights = nullptr; // (n_experts,) - buffer for expert weights, decided by router
   float* _active_experts_weights = nullptr; // (n_active_experts,) - buffer for weights of top K experts (active experts)
