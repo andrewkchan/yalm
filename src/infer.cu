@@ -612,34 +612,35 @@ void fused_attn(
 		// Load next kv tiles
 		int kvh = h / group_size;
     int kvh_tile = kvh % kv_heads_per_tile;
-    for (int s = t+threadIdx.x; s < min(t+threadIdx.x+kv_len_per_tile, t_end); s += blockDim.x) {
-			int s_tile = s % kv_len_per_tile;
-      if (h % kv_heads_per_tile == 0) {
-        // TODO: Improve load packing - issuing redundant loads per tile sometimes
-        constexpr int UNROLL = 16;
-        half v_0; half k_0; 
-        half v_1; half k_1; 
-        half v_2; half k_2; 
-        half v_3; half k_3;
-        half v_4; half k_4; 
-        half v_5; half k_5; 
-        half v_6; half k_6; 
-        half v_7; half k_7;
-        half v_8; half k_8; 
-        half v_9; half k_9; 
-        half v_10; half k_10; 
-        half v_11; half k_11;
-        half v_12; half k_12; 
-        half v_13; half k_13; 
-        half v_14; half k_14; 
-        half v_15; half k_15;
-        for (int i = 0; i < head_dim; i++) {
-          int ctr_mod = i % UNROLL;
+    if (h % kv_heads_per_tile == 0) {
+      // TODO: Improve load packing - issuing redundant loads per tile sometimes
+      constexpr int UNROLL = 16;
+      half v_0; half k_0; 
+      half v_1; half k_1; 
+      half v_2; half k_2; 
+      half v_3; half k_3;
+      half v_4; half k_4; 
+      half v_5; half k_5; 
+      half v_6; half k_6; 
+      half v_7; half k_7;
+      half v_8; half k_8; 
+      half v_9; half k_9; 
+      half v_10; half k_10; 
+      half v_11; half k_11;
+      half v_12; half k_12; 
+      half v_13; half k_13; 
+      half v_14; half k_14; 
+      half v_15; half k_15;
+      for (int i = i_start; i < head_dim; i += blockDim.x) {
+        int s = t;
+        for (int ctr = 0; s < min(t+kv_len_per_tile, t_end) - UNROLL + 1; s++, ctr++) {
+          int s_tile = s % kv_len_per_tile;
+          int ctr_mod = ctr % UNROLL;
           if (ctr_mod == 0) {
             // Prefetch every UNROLL iters
             #define PREFETCH(j) \
-              v_##j = vb[s * n_kv_heads * head_dim + kvh * head_dim + i + j]; \
-              k_##j = kb[s * n_kv_heads * head_dim + kvh * head_dim + i + j];
+              v_##j = vb[(s+j) * n_kv_heads * head_dim + kvh * head_dim + i]; \
+              k_##j = kb[(s+j) * n_kv_heads * head_dim + kvh * head_dim + i];
             PREFETCH(0)
             PREFETCH(1)
             PREFETCH(2)
@@ -684,6 +685,13 @@ void fused_attn(
             CASE(15)
             #undef CASE
           }
+        }
+        for (; s < min(t+kv_len_per_tile, t_end); s++) {
+          int s_tile = s % kv_len_per_tile;
+          half v = vb[s * n_kv_heads * head_dim + kvh * head_dim + i];
+          half k = kb[s * n_kv_heads * head_dim + kvh * head_dim + i];
+          k_tile[s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim + i] = k;
+          v_tile[s_tile * kv_heads_per_tile * head_dim + kvh_tile * head_dim + i] = v;
         }
       }
     }
