@@ -773,11 +773,11 @@ void fused_attn_mix(
   float l_item = 0.0f;
   for (int split = 0; split < n_splits; split++) {
     float* acc_head = acc + split*n_heads*head_dim + h*head_dim;
-    float delta = m[h] - max_m;
+    float delta = m[split*n_heads + h] - max_m;
     if (delta > 0.0) {
       acc_item = acc_item*expf(-delta) + acc_head[i];
       l_item = l_item*expf(-delta) + l[split*n_heads + h];
-      max_m += delta;
+      max_m = m[split*n_heads + h];
     } else {
       acc_item = acc_item + acc_head[i]*expf(delta);
       l_item = l_item + l[split*n_heads + h]*expf(delta);
